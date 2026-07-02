@@ -103,7 +103,7 @@ You can route on any project tag:
 - Predefined tags, such as `_alias`, `_csp`, and `_region`. For the full list, refer to [Tags in CPS](docs-content://explore-analyze/cross-project-search/cross-project-search-tags.md).
 - Custom tags that you define in the {{ecloud}} UI.
 
-Combine tags with the `AND`, `OR`, and `NOT` operators and group terms with parentheses. Use prefix or suffix wildcards (`*`) to match part of a tag value. Tag matching is case-insensitive. The syntax is the same for {{esql}} and the `_search` API.
+You can combine tags with the `AND`, `OR`, and `NOT` operators, group terms with parentheses, and use prefix or suffix wildcards (`*`) to match part of a tag value. Tag matching is case-insensitive. The syntax is the same for {{esql}} and the `_search` API.
 
 The following expressions are all valid:
 

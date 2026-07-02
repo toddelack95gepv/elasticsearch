@@ -710,7 +710,14 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
             // stay out of the read/reconciliation schema — every format reader gets them for free, the read path is
             // untouched, and the copy reuses the plan's projection, pushdown alias-substitution, and cast machinery.
             List<Alias> copyAliases = copyToAliases(plan.mapping(), relation.output(), plan.source());
-            return copyAliases.isEmpty() ? relation : new Eval(plan.source(), relation, copyAliases);
+            // A requested _source on a _source.enabled: false dataset binds to a null constant here instead of a
+            // relation column — see bindMetadataFields's nullConstantMetadata. Combined with copy_to into one Eval.
+            List<Alias> evalAliases = bindResult.nullConstantMetadata();
+            if (copyAliases.isEmpty() == false) {
+                evalAliases = new ArrayList<>(evalAliases);
+                evalAliases.addAll(copyAliases);
+            }
+            return evalAliases.isEmpty() ? relation : new Eval(plan.source(), relation, evalAliases);
         }
 
         /**
@@ -758,13 +765,20 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
 
         /**
          * Result of {@link #bindMetadataFields}: the enriched schema (resolved standard /
-         * {@code _file.*} names appended to the base schema) and the list of metadata expressions
-         * the bind could not resolve. The unresolved list is threaded through to
-         * {@link ExternalRelation#metadataFields()} so the verifier's
+         * {@code _file.*} names appended to the base schema), the list of metadata expressions the
+         * bind could not resolve, and any metadata columns bound to a null constant instead of a
+         * schema column (currently only a requested {@code _source} on a {@code _source.enabled:
+         * false} dataset — see the {@code _source} branch below). The unresolved list is threaded
+         * through to {@link ExternalRelation#metadataFields()} so the verifier's
          * {@code checkUnresolvedAttributes} walk fires the indexed-equivalent
-         * {@code "Unresolved metadata pattern [...]"} error.
+         * {@code "Unresolved metadata pattern [...]"} error. The null-constant list rides an
+         * {@link Eval} above the relation, alongside {@link #copyToAliases}.
          */
-        private record MetadataBindResult(List<Attribute> schema, List<? extends NamedExpression> unresolvedMetadata) {}
+        private record MetadataBindResult(
+            List<Attribute> schema,
+            List<? extends NamedExpression> unresolvedMetadata,
+            List<Alias> nullConstantMetadata
+        ) {}
 
         /**
          * Walks the user's METADATA clause. Names registered in
@@ -784,7 +798,7 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
             Set<String> partitionColumnNames
         ) {
             if (plan.metadataFields().isEmpty()) {
-                return new MetadataBindResult(baseSchema, List.of());
+                return new MetadataBindResult(baseSchema, List.of(), List.of());
             }
             Set<String> existing = new LinkedHashSet<>();
             for (Attribute a : baseSchema) {
@@ -792,6 +806,7 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
             }
             List<Attribute> enriched = null;
             List<NamedExpression> unresolved = null;
+            List<Alias> nullConstants = null;
             for (NamedExpression requested : plan.metadataFields()) {
                 // FROM's parser threads non-standard names through UnresolvedMetadataAttributeExpression
                 // (whose name() throws); EXTERNAL's parser threads plain UnresolvedAttribute. Resolve
@@ -800,12 +815,18 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
                 if (existing.contains(name)) {
                     continue;
                 }
-                // _source.enabled: false — the dataset opted out of a synthetic _source, so reject the request loudly
-                // rather than returning a silently-null column.
+                // _source.enabled: false — mirrors a real index's disabled-_source behavior (SourceFieldMapper's
+                // ConstantNull block loader, see EsPhysicalOperationProviders): the query succeeds and _source reads
+                // as null. Bind _source to a null literal instead of adding it to the schema, so the relation's
+                // output never carries it and the producer-side SynthesizeExternalSource is never asked to build it
+                // (VirtualColumnIterator only synthesizes _source when it finds the column in the relation's output).
                 if (ExternalMetadataColumns.SOURCE.equals(name) && sourceDisabled(plan)) {
-                    throw new IllegalArgumentException(
-                        "[_source] is not available: it is disabled (_source.enabled: false) for this dataset"
-                    );
+                    if (nullConstants == null) {
+                        nullConstants = new ArrayList<>();
+                    }
+                    nullConstants.add(new Alias(plan.source(), name, new Literal(plan.source(), null, DataType.SOURCE)));
+                    existing.add(name);
+                    continue;
                 }
                 // _id.path names the column the reader stamps _id from. If the dataset declares one but the resolved
                 // schema has no such DATA column — a typo, the files lost it, or it is a partition/virtual column the
@@ -865,7 +886,8 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
             }
             List<Attribute> resolvedSchema = enriched == null ? baseSchema : List.copyOf(enriched);
             List<? extends NamedExpression> unresolvedList = unresolved == null ? List.of() : List.copyOf(unresolved);
-            return new MetadataBindResult(resolvedSchema, unresolvedList);
+            List<Alias> nullConstantList = nullConstants == null ? List.of() : List.copyOf(nullConstants);
+            return new MetadataBindResult(resolvedSchema, unresolvedList, nullConstantList);
         }
 
         private static boolean sourceDisabled(UnresolvedExternalRelation plan) {

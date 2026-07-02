@@ -1005,11 +1005,12 @@ public class FromDatasetIT extends AbstractEsqlIntegTestCase {
         }
     }
 
-    public void testSourceDisabledRejectsMetadataSource() throws Exception {
+    public void testSourceDisabledReturnsEmptySource() throws Exception {
         assertAcked(client().execute(PutDataSourceAction.INSTANCE, putDataSourceRequest("local_ds", Map.of())));
         java.util.Map<String, DatasetFieldMapping> properties = new java.util.LinkedHashMap<>();
         properties.put("emp_no", new DatasetFieldMapping("integer", null));
-        // _source.enabled: false -> METADATA _source must be rejected, not returned as a silently-null column.
+        // _source.enabled: false -> METADATA _source must succeed with a null _source column, matching a real
+        // index whose _source is disabled (SourceFieldMapper's ConstantNull block loader) rather than erroring.
         DatasetMapping mapping = new DatasetMapping(new DatasetMapping.Mappings(DatasetMapping.Dynamic.TRUE, properties, false));
         assertAcked(
             client().execute(
@@ -1027,11 +1028,19 @@ public class FromDatasetIT extends AbstractEsqlIntegTestCase {
             )
         );
 
-        Exception ex = expectThrows(
-            Exception.class,
-            () -> run(syncEsqlQueryRequest("FROM employees_source_disabled METADATA _source | LIMIT 1"), TIMEOUT)
-        );
-        assertCauseMessageContains(ex, "[_source] is not available");
+        try (
+            var response = run(
+                syncEsqlQueryRequest("FROM employees_source_disabled METADATA _source | KEEP _source | SORT _source | LIMIT 10"),
+                TIMEOUT
+            )
+        ) {
+            assertThat(response.columns().get(0).name(), equalTo("_source"));
+            List<List<Object>> rows = getValuesList(response);
+            assertThat(rows, hasSize(3));
+            for (List<Object> row : rows) {
+                assertThat("_source is null when _source.enabled: false", row.get(0), org.hamcrest.Matchers.nullValue());
+            }
+        }
     }
 
     public void testSourceEnabledByDefaultAllowsMetadataSource() throws Exception {

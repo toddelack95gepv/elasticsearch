@@ -7,7 +7,10 @@
 
 package org.elasticsearch.xpack.esql.plan.logical;
 
+import org.elasticsearch.TransportVersion;
+import org.elasticsearch.test.TransportVersionUtils;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
+import org.elasticsearch.xpack.esql.datasources.DeclaredReadSpec;
 import org.elasticsearch.xpack.esql.datasources.spi.FileList;
 import org.elasticsearch.xpack.esql.datasources.spi.SimpleSourceMetadata;
 
@@ -15,6 +18,8 @@ import java.io.IOException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+
+import static org.hamcrest.Matchers.equalTo;
 
 public class ExternalRelationSerializationTests extends AbstractLogicalPlanSerializationTests<ExternalRelation> {
 
@@ -112,5 +117,46 @@ public class ExternalRelationSerializationTests extends AbstractLogicalPlanSeria
             fullSchema,
             roundTripped.metadata().schema()
         );
+    }
+
+    /** The declared read-instructions ride the wire on a node supporting {@code dataset_declared_schema}. */
+    public void testDeclaredReadSpecSurvivesRoundTripWhenSupported() throws IOException {
+        DeclaredReadSpec spec = DeclaredReadSpec.of(Map.of("id", "emp_no"), "id");
+        List<Attribute> output = randomFieldAttributes(1, 3, false);
+        SimpleSourceMetadata metadata = new SimpleSourceMetadata(output, "csv", "s3://bucket/x.csv", null, null, Map.of(), Map.of());
+        ExternalRelation original = new ExternalRelation(
+            randomSource(),
+            metadata.location(),
+            metadata,
+            output,
+            FileList.UNRESOLVED,
+            Map.of(),
+            null,
+            List.of(),
+            spec
+        );
+        ExternalRelation roundTripped = copyInstance(original, TransportVersion.current());
+        assertThat(roundTripped.declaredReadSpec(), equalTo(spec));
+    }
+
+    /** A node predating {@code dataset_declared_schema} falls back to {@link DeclaredReadSpec#NONE}. */
+    public void testDeclaredReadSpecDroppedForOlderTransportVersion() throws IOException {
+        DeclaredReadSpec spec = DeclaredReadSpec.of(Map.of("id", "emp_no"), "id");
+        List<Attribute> output = randomFieldAttributes(1, 3, false);
+        SimpleSourceMetadata metadata = new SimpleSourceMetadata(output, "csv", "s3://bucket/x.csv", null, null, Map.of(), Map.of());
+        ExternalRelation original = new ExternalRelation(
+            randomSource(),
+            metadata.location(),
+            metadata,
+            output,
+            FileList.UNRESOLVED,
+            Map.of(),
+            null,
+            List.of(),
+            spec
+        );
+        TransportVersion before = TransportVersionUtils.getPreviousVersion(TransportVersion.fromName("dataset_declared_schema"));
+        ExternalRelation roundTripped = copyInstance(original, before);
+        assertThat(roundTripped.declaredReadSpec(), equalTo(DeclaredReadSpec.NONE));
     }
 }

@@ -19,7 +19,6 @@ import org.elasticsearch.xpack.esql.core.expression.NamedExpression;
 import org.elasticsearch.xpack.esql.core.expression.VirtualAttribute;
 import org.elasticsearch.xpack.esql.core.util.Holder;
 import org.elasticsearch.xpack.esql.datasources.ExternalMetadataColumns;
-import org.elasticsearch.xpack.esql.datasources.ExternalSourceResolver;
 import org.elasticsearch.xpack.esql.plan.logical.Aggregate;
 import org.elasticsearch.xpack.esql.plan.logical.EsRelation;
 import org.elasticsearch.xpack.esql.plan.logical.Eval;
@@ -40,7 +39,6 @@ import org.elasticsearch.xpack.esql.rule.Rule;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.stream.Collectors;
 
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.PruneEmptyPlans.skipPlan;
@@ -269,18 +267,12 @@ public final class PruneColumns extends Rule<LogicalPlan, LogicalPlan> {
     }
 
     /**
-     * The declared {@code _id.path} (logical column name) carried in the external relation's config under
-     * {@link org.elasticsearch.xpack.esql.datasources.ExternalSourceResolver#CONFIG_DECLARED_ID_PATH}, or {@code null}
-     * when the dataset declares no {@code mappings._id.path}. Mirrors how the {@code source} renames ride the same config
-     * map to the reader boundary.
+     * The declared {@code _id.path} (logical column name) carried on the external relation's typed
+     * {@link org.elasticsearch.xpack.esql.datasources.DeclaredReadSpec}, or {@code null} when the dataset declares no
+     * {@code mappings._id.path}.
      */
     private static String declaredIdPath(ExternalRelation ext) {
-        Map<String, Object> config = ext.metadata() != null ? ext.metadata().config() : null;
-        if (config == null) {
-            return null;
-        }
-        Object value = config.get(ExternalSourceResolver.CONFIG_DECLARED_ID_PATH);
-        return value instanceof String s ? s : null;
+        return ext.declaredReadSpec().idPath();
     }
 
     // TODO: see ResolveUnmapped#patchFork comment

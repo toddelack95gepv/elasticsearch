@@ -89,38 +89,7 @@ public class ExternalSourceResolver {
      */
     public static final String DATASOURCE_CONFIG_KEY = "_datasource";
 
-    /**
-     * Config key carrying a declared mapping's logical&rarr;physical column renames ({@code Map<String,String>}). Consumed
-     * on the data node by the centralized last-mile physicalization ({@link PhysicalNames#fromConfig}, at
-     * {@code FileSourceFactory} / the operator factory) and by the pushdown planner rules ({@code PushFiltersToSource},
-     * {@code PushAggregatesToExternalSource}). Readers receive already-physical names and stay rename-agnostic; text
-     * readers read positionally. Injected by {@code resolve} only when the mapping renames a column.
-     */
-    public static final String CONFIG_DECLARED_RENAMES = "_declared_renames";
-
-    /**
-     * Config key carrying a declared mapping's {@code _id.path} (a single logical column name, {@code String}). Consumed
-     * on the data node by {@link VirtualColumnIterator}, which stamps each row's {@code _id} from that column's value
-     * instead of the synthetic (file+row-position) identity. Injected by {@code resolve} only when the mapping declares
-     * {@code mappings._id.path}; absent otherwise, in which case the synthetic {@code _id} path is used unchanged.
-     */
-    public static final String CONFIG_DECLARED_ID_PATH = "_declared_id_path";
-
-    public static final Set<String> CONFIG_KEYS = Set.of(
-        CONFIG_SCHEMA_RESOLUTION,
-        DATASOURCE_CONFIG_KEY,
-        CONFIG_DECLARED_RENAMES,
-        CONFIG_DECLARED_ID_PATH
-    );
-
-    /**
-     * The subset of {@link #CONFIG_KEYS} that {@code resolve} <b>derives</b> from the dataset's declared mapping and
-     * injects into the query-path config — never user-settable dataset settings. Like {@link #DATASOURCE_CONFIG_KEY}
-     * they are internal envelopes: the user declares {@code mappings} (a {@code path} rename, {@code _id.path}), and the
-     * resolver turns that into these keys. {@code FileSourceFactoryValidationTests} excludes them (with
-     * {@link #DATASOURCE_CONFIG_KEY}) when pinning the user-settable dataset vocabulary against {@code COORDINATOR_KEYS}.
-     */
-    public static final Set<String> DERIVED_CONFIG_KEYS = Set.of(CONFIG_DECLARED_RENAMES, CONFIG_DECLARED_ID_PATH);
+    public static final Set<String> CONFIG_KEYS = Set.of(CONFIG_SCHEMA_RESOLUTION, DATASOURCE_CONFIG_KEY);
 
     private static final int MAX_PARALLEL_METADATA_READS = 16;
 
@@ -331,21 +300,13 @@ public class ExternalSourceResolver {
                     List<PartitionFilterHintExtractor.PartitionFilterHint> hints = filterHints != null ? filterHints.get(path) : null;
                     boolean hivePartitioning = isHivePartitioningEnabled(config);
                     DatasetMapping declaredMapping = declaredMappings != null ? declaredMappings.get(path) : null;
-                    // Carry any logical->physical column renames in config; consumed on the data node by the centralized
-                    // last-mile physicalization (PhysicalNames) and the pushdown planner rules. Readers stay rename-agnostic.
-                    Map<String, String> renames = DeclaredSchemaResolver.renameMap(declaredMapping);
-                    if (renames.isEmpty() == false) {
-                        config = new HashMap<>(config);
-                        config.put(CONFIG_DECLARED_RENAMES, renames);
-                    }
-                    // Carry the declared _id.path (logical column name) so the data node stamps _id from that column
-                    // rather than the synthetic (file+row-position) identity. Consumed by VirtualColumnIterator.
-                    DatasetMapping.Mappings declaredMappings2 = declaredMapping == null ? null : declaredMapping.mappings();
-                    String idPath = declaredMappings2 == null ? null : declaredMappings2.idPath();
-                    if (idPath != null) {
-                        config = new HashMap<>(config);
-                        config.put(CONFIG_DECLARED_ID_PATH, idPath);
-                    }
+                    // The declared mapping's read-instructions (logical->physical column renames, _id.path) travel as a
+                    // typed DeclaredReadSpec on the ResolvedSource -> ExternalRelation -> ExternalSourceExec seam, rather
+                    // than as string keys in the untyped config map. Renames are consumed on the data node by the
+                    // centralized last-mile physicalization (PhysicalNames) and the pushdown planner rules (readers stay
+                    // rename-agnostic); _id.path makes the data node stamp _id from that column rather than the synthetic
+                    // (file+row-position) identity (VirtualColumnIterator).
+                    DeclaredReadSpec declaredReadSpec = declaredReadSpecOf(declaredMapping);
                     // null => legacy eager for every path; non-null => eager only for listed paths.
                     boolean requiresStats = pathsRequiringStats == null || pathsRequiringStats.contains(path);
 
@@ -364,7 +325,7 @@ public class ExternalSourceResolver {
                         if (declaredMapping != null && isStrict(declaredMapping) == false) {
                             resolvedSource = applyNonStrictOverlay(resolvedSource, declaredMapping);
                         }
-                        resolved.put(path, resolvedSource);
+                        resolved.put(path, resolvedSource.withDeclaredReadSpec(declaredReadSpec));
                         LOGGER.debug("Successfully resolved external source: {}", path);
                     } catch (TaskCancelledException e) {
                         // Surface cancellation unwrapped so the client sees a clean cancellation (4xx) rather
@@ -454,7 +415,7 @@ public class ExternalSourceResolver {
             extMetadata = buildMetadataFromCache(schemaEntry, schema, config);
         } else {
             SourceMetadata metadata = resolveSingleSource(path, config);
-            extMetadata = wrapAsExternalSourceMetadata(metadata, config);
+            extMetadata = wrapAsExternalSourceMetadata(metadata, config, declaredReadSpecOf(declaredMapping));
             object = provider.newObject(storagePath);
         }
 
@@ -478,6 +439,18 @@ public class ExternalSourceResolver {
         return declaredMapping != null
             && declaredMapping.mappings() != null
             && declaredMapping.mappings().dynamic() == DatasetMapping.Dynamic.FALSE;
+    }
+
+    /**
+     * The typed read-instructions a declared mapping produces for the data node: the logical&rarr;physical column
+     * renames of a {@code path} move plus the declared {@code _id.path}. {@link DeclaredReadSpec#NONE} when there is no
+     * mapping or it declares neither. Built once per path in {@link #resolve} and carried on the {@code ResolvedSource}.
+     */
+    private static DeclaredReadSpec declaredReadSpecOf(@Nullable DatasetMapping declaredMapping) {
+        Map<String, String> renames = DeclaredSchemaResolver.renameMap(declaredMapping);
+        DatasetMapping.Mappings mappings = declaredMapping == null ? null : declaredMapping.mappings();
+        String idPath = mappings == null ? null : mappings.idPath();
+        return DeclaredReadSpec.of(renames, idPath);
     }
 
     /**
@@ -505,7 +478,8 @@ public class ExternalSourceResolver {
         String sourceType = FormatNameResolver.resolve(config, path);
         ExternalSourceMetadata extMetadata = wrapAsExternalSourceMetadata(
             new SimpleSourceMetadata(logicalSchema, sourceType, path),
-            config
+            config,
+            declaredReadSpecOf(declaredMapping)
         );
         FileList singletonList = GlobExpander.fileListOf(
             List.of(new StorageEntry(storagePath, object.length(), object.lastModified())),
@@ -564,7 +538,8 @@ public class ExternalSourceResolver {
         String sourceType = FormatNameResolver.resolve(config, path);
         ExternalSourceMetadata extMetadata = wrapAsExternalSourceMetadata(
             new SimpleSourceMetadata(logicalSchema, sourceType, path),
-            config
+            config,
+            declaredReadSpecOf(declaredMapping)
         );
         extMetadata = enrichWithFileCount(extMetadata, listing.fileCount());
 
@@ -782,7 +757,7 @@ public class ExternalSourceResolver {
             extMetadata = buildMetadataFromCache(schemaEntry, schema, config);
         } else {
             SourceMetadata metadata = resolveSingleSource(anchorPath.toString(), config);
-            extMetadata = wrapAsExternalSourceMetadata(metadata, config);
+            extMetadata = wrapAsExternalSourceMetadata(metadata, config, declaredReadSpecOf(declaredMapping));
         }
 
         extMetadata = enrichWithFileCount(extMetadata, listing.fileCount());
@@ -1548,7 +1523,11 @@ public class ExternalSourceResolver {
         }
     }
 
-    private ExternalSourceMetadata wrapAsExternalSourceMetadata(SourceMetadata metadata, Map<String, Object> queryConfig) {
+    private ExternalSourceMetadata wrapAsExternalSourceMetadata(
+        SourceMetadata metadata,
+        Map<String, Object> queryConfig,
+        DeclaredReadSpec declaredReadSpec
+    ) {
         validateSchemaUsesOnlyReferenceAttributes(metadata.schema());
 
         if (metadata instanceof ExternalSourceMetadata extMetadata) {
@@ -1558,10 +1537,10 @@ public class ExternalSourceResolver {
                 // their factory is responsible for populating sourceMetadata() — statistics()
                 // is typically empty so there is nothing extra to embed.
                 //
-                // This early return does NOT merge queryConfig — so resolver-derived declared-mapping keys
-                // (renames, _id.path) would silently vanish on this rail. Until this rail supports them,
-                // reject loudly rather than ignore a mapping the user declared.
-                if (queryConfig != null && DERIVED_CONFIG_KEYS.stream().anyMatch(queryConfig::containsKey)) {
+                // This early return does NOT carry the declared read-instructions onto this rail's metadata — so a
+                // declared mapping's renames / _id.path would silently vanish. Until this rail supports them, reject
+                // loudly rather than ignore a mapping the user declared.
+                if (declaredReadSpec.isEmpty() == false) {
                     throw new IllegalArgumentException(
                         "declared mappings with [path] renames or [_id.path] are not supported for this source type"
                     );

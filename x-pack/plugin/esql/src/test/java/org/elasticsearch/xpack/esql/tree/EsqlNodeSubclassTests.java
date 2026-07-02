@@ -39,6 +39,7 @@ import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.tree.SourceTests;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.core.type.EsField;
+import org.elasticsearch.xpack.esql.datasources.DeclaredReadSpec;
 import org.elasticsearch.xpack.esql.datasources.ExternalSchema;
 import org.elasticsearch.xpack.esql.datasources.SchemaReconciliation;
 import org.elasticsearch.xpack.esql.datasources.spi.FileList;
@@ -504,6 +505,12 @@ public class EsqlNodeSubclassTests<T extends B, B extends Node<B>> extends NodeS
             return new SchemaReconciliation.FileSchemaInfo(new ExternalSchema(List.of()), null, null);
         } else if (argClass == ExternalSchema.class) {
             return new ExternalSchema(List.of());
+        } else if (argClass == DeclaredReadSpec.class) {
+            // Typed carrier record; build a non-trivial instance so transform/mutation tests see a real value.
+            return DeclaredReadSpec.of(
+                Map.of(randomAlphaOfLength(4), randomAlphaOfLength(5)),
+                randomBoolean() ? randomAlphaOfLength(4) : null
+            );
         } else if (argClass == MatchConfig.class) {
             // MatchConfig is final, cannot be mocked
             return new MatchConfig(randomAlphaOfLength(5), randomInt(10), randomFrom(DataType.types()));

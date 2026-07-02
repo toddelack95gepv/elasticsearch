@@ -12,6 +12,7 @@ import org.elasticsearch.test.TransportVersionUtils;
 import org.elasticsearch.xpack.encryption.spi.EncryptedData;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
+import org.elasticsearch.xpack.esql.datasources.DeclaredReadSpec;
 import org.elasticsearch.xpack.esql.datasources.ExternalSourceResolver;
 import org.elasticsearch.xpack.esql.datasources.FileSplit;
 import org.elasticsearch.xpack.esql.datasources.spi.ExternalSplit;
@@ -221,5 +222,28 @@ public class ExternalSourceExecSerializationTests extends AbstractPhysicalPlanSe
 
         assertThat(roundTripped.config().containsKey(ExternalSourceResolver.DATASOURCE_CONFIG_KEY), equalTo(false));
         assertThat(roundTripped.config().get("format"), equalTo("csv"));
+    }
+
+    /**
+     * The declared read-instructions (renames + {@code _id.path}) ride the wire on a node that supports the
+     * {@code dataset_declared_schema} transport version.
+     */
+    public void testDeclaredReadSpecSurvivesRoundTripWhenSupported() throws IOException {
+        DeclaredReadSpec spec = DeclaredReadSpec.of(Map.of("id", "emp_no"), "id");
+        ExternalSourceExec original = randomExternalSourceExec().withDeclaredReadSpec(spec);
+        ExternalSourceExec roundTripped = copyInstance(original, TransportVersion.current());
+        assertThat(roundTripped.declaredReadSpec(), equalTo(spec));
+    }
+
+    /**
+     * A target node predating {@code dataset_declared_schema} cannot deserialize the spec, so the coordinator omits
+     * it and the node falls back to {@link DeclaredReadSpec#NONE} (declared renames / {@code _id.path} do not apply).
+     */
+    public void testDeclaredReadSpecDroppedForOlderTransportVersion() throws IOException {
+        DeclaredReadSpec spec = DeclaredReadSpec.of(Map.of("id", "emp_no"), "id");
+        ExternalSourceExec original = randomExternalSourceExec().withDeclaredReadSpec(spec);
+        TransportVersion before = TransportVersionUtils.getPreviousVersion(TransportVersion.fromName("dataset_declared_schema"));
+        ExternalSourceExec roundTripped = copyInstance(original, before);
+        assertThat(roundTripped.declaredReadSpec(), equalTo(DeclaredReadSpec.NONE));
     }
 }

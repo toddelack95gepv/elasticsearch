@@ -29,9 +29,9 @@ import java.util.Set;
  *
  * <p>Used by the resolver for both supply modes: in strict mode ({@code dynamic: false}) {@link #declaredAttributes}
  * is the entire resolved schema (no file is read); in non-strict mode the declared attributes overlay (and beat) the
- * inferred ones of the same column. The {@link #renameMap} is injected into the read config
- * ({@link ExternalSourceResolver#CONFIG_DECLARED_RENAMES}) and consumed at the reader-facing boundaries via
- * {@link PhysicalNames}; {@code ColumnMapping}/reconciliation stay in logical space. It carries only renamed columns.
+ * inferred ones of the same column. The {@link #renameMap} rides the typed {@link DeclaredReadSpec} to the data node
+ * and is consumed at the reader-facing boundaries via {@link PhysicalNames}; {@code ColumnMapping}/reconciliation stay
+ * in logical space. It carries only renamed columns.
  */
 public final class DeclaredSchemaResolver {
 

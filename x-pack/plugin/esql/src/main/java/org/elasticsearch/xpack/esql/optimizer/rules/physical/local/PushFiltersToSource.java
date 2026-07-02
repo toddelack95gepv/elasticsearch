@@ -294,7 +294,7 @@ public class PushFiltersToSource extends PhysicalOptimizerRules.ParameterizedOpt
         // mints must reference the file's PHYSICAL columns. Physicalize only the conjuncts handed to the mint; map the
         // returned pushed/remainder expressions back to logical (via inverse, NameId-preserving) so the plan's FilterExec
         // and reconciliation stay logical. No-op when the dataset declares no rename.
-        Map<String, String> renames = PhysicalNames.fromConfig(externalExec.config());
+        Map<String, String> renames = externalExec.declaredReadSpec().renames();
         Map<String, String> toLogical = PhysicalNames.inverse(renames);
         List<Expression> mintInput = PhysicalNames.translateExpressionNames(pushableCandidates, renames);
         // Invariant: no logical rename-source name may survive into the opaque predicate the reader receives. This is the

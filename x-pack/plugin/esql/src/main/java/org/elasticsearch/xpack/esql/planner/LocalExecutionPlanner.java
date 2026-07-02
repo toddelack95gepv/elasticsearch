@@ -1895,6 +1895,7 @@ public class LocalExecutionPlanner {
             .executor(operatorFactoryRegistry.executor())
             .fileReadExecutor(operatorFactoryRegistry.fileReadExecutor())
             .config(externalSource.config())
+            .declaredReadSpec(externalSource.declaredReadSpec())
             .sourceMetadata(externalSource.sourceMetadata())
             .pushedFilter(externalSource.pushedFilter())
             .pushedExpressions(externalSource.pushedExpressions())

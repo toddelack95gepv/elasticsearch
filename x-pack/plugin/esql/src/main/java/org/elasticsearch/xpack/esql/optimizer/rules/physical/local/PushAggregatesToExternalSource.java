@@ -136,7 +136,7 @@ public class PushAggregatesToExternalSource extends PhysicalOptimizerRules.Param
             stats,
             values,
             dataTypes,
-            PhysicalNames.fromConfig(externalExec.config())
+            externalExec.declaredReadSpec().renames()
         ) == false) {
             return aggregateExec;
         }

@@ -693,7 +693,8 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
                 resolvedSource.fileList(),
                 resolvedSource.schemaMap(),
                 plan.datasetName(),
-                bindResult.unresolvedMetadata()
+                bindResult.unresolvedMetadata(),
+                resolvedSource.declaredReadSpec()
             );
             // A declared `copy_to` materializes as an EVAL `target = <source column>` above the base relation. Copies
             // stay out of the read/reconciliation schema — every format reader gets them for free, the read path is

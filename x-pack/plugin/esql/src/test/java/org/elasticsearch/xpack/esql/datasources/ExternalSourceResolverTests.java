@@ -103,6 +103,24 @@ public class ExternalSourceResolverTests extends ESTestCase {
      *       are preserved verbatim since each column's type is consistent across files.</li>
      * </ul>
      */
+    /**
+     * Guards {@link ExternalSourceResolver#FILE_TYPED_FORMATS} — the hand-maintained classification of columnar
+     * (self-typed) formats that gates all three columnar declaration rejects (format-on-columnar, strict type mismatch,
+     * non-strict retype). The set has no SPI-derived source of truth yet (see the constant's TODO), so pin its exact
+     * membership: dropping an entry silently disables the rejects for that format, and a new columnar reader must be
+     * added here. A change to this set is a deliberate, reviewed test diff — not a silent drift.
+     */
+    public void testFileTypedFormatsGatesColumnarRejects() {
+        assertEquals(
+            Set.of(FormatNameResolver.FORMAT_PARQUET, "orc", FormatNameResolver.FORMAT_PARQUET_RS),
+            ExternalSourceResolver.FILE_TYPED_FORMATS
+        );
+        // Text formats parse into the declared type, so a declared format/retype IS honored — they must NOT be here.
+        assertFalse(ExternalSourceResolver.FILE_TYPED_FORMATS.contains("csv"));
+        assertFalse(ExternalSourceResolver.FILE_TYPED_FORMATS.contains("tsv"));
+        assertFalse(ExternalSourceResolver.FILE_TYPED_FORMATS.contains("ndjson"));
+    }
+
     public void testMultiFileResolvedSchemaPerStrategy() throws Exception {
         List<Attribute> schema1 = List.of(attr("emp_no", DataType.INTEGER), attr("name", DataType.KEYWORD));
         List<Attribute> schema2 = List.of(attr("emp_no", DataType.INTEGER), attr("name", DataType.KEYWORD), attr("extra", DataType.LONG));

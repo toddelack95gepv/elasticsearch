@@ -596,10 +596,16 @@ public class ExternalSourceResolver {
      * type mismatch. Same reason a declared date {@code format} (a text-parse pattern) is meaningless here. Text formats
      * (CSV/TSV/NDJSON) parse into the declared type, so they are absent. {@code parquet-rs} is the native parquet reader
      * (feature-flagged) — columnar like {@code parquet}, so it belongs here too.
+     * <p>
+     * Three rejects gate on this set: {@link #rejectDeclaredFormatOnColumnar}, {@link #rejectStrictColumnarTypeMismatch},
+     * and the non-strict {@link #rejectFileTypedRetypes}. Removing an entry silently disables all three for that format;
+     * adding a columnar reader without adding its {@code formatName()} here lets a declared format/retype slip through.
+     * {@code ExternalSourceResolverTests#testFileTypedFormatsGatesColumnarRejects} pins the membership so either drift
+     * is a test failure.
      * TODO: this classification belongs on the {@code FormatReader} SPI (a capability method) — move it there with the
      * typed DeclaredReadSpec carrier; a single documented constant beats threading a new SPI method for three formats.
      */
-    private static final Set<String> FILE_TYPED_FORMATS = Set.of("parquet", "orc", FormatNameResolver.FORMAT_PARQUET_RS);
+    static final Set<String> FILE_TYPED_FORMATS = Set.of("parquet", "orc", FormatNameResolver.FORMAT_PARQUET_RS);
 
     /**
      * The declaration-vs-source violations detectable without reading file content: a declared {@code format} on a

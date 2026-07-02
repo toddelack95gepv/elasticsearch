@@ -8,6 +8,8 @@
 package org.elasticsearch.xpack.esql.analysis;
 
 import org.elasticsearch.TransportVersion;
+import org.elasticsearch.cluster.metadata.DatasetFieldMapping;
+import org.elasticsearch.cluster.metadata.DatasetMapping;
 import org.elasticsearch.common.logging.HeaderWarning;
 import org.elasticsearch.common.logging.LoggerMessageFormat;
 import org.elasticsearch.common.lucene.BytesRefs;
@@ -717,12 +719,8 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
          * so the copy is a plain reference — the optimizer substitutes it on pushdown. Empty when nothing copies, so
          * the common path adds no {@code Eval}.
          */
-        private static List<Alias> copyToAliases(
-            org.elasticsearch.cluster.metadata.DatasetMapping mapping,
-            List<Attribute> baseOutput,
-            Source source
-        ) {
-            org.elasticsearch.cluster.metadata.DatasetMapping.Mappings mappings = mapping == null ? null : mapping.mappings();
+        private static List<Alias> copyToAliases(DatasetMapping mapping, List<Attribute> baseOutput, Source source) {
+            DatasetMapping.Mappings mappings = mapping == null ? null : mapping.mappings();
             if (mappings == null) {
                 return List.of();
             }
@@ -731,7 +729,7 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
                 byName.putIfAbsent(a.name(), a);
             }
             List<Alias> aliases = new ArrayList<>();
-            for (Map.Entry<String, org.elasticsearch.cluster.metadata.DatasetFieldMapping> e : mappings.properties().entrySet()) {
+            for (Map.Entry<String, DatasetFieldMapping> e : mappings.properties().entrySet()) {
                 List<String> targets = e.getValue().copyTo();
                 if (targets.isEmpty()) {
                     continue;

@@ -182,10 +182,12 @@ public final class DeclaredSchemaResolver {
 
     private static DataType resolveType(String column, String type) {
         DataType resolved = DataType.fromNameOrAlias(type);
-        // PUT-time DeclaredSchemaValidator already rejects undeclarable types; this is the defensive backstop
-        // for a mapping that reached resolution another way (e.g. a hand-edited cluster state).
-        if (resolved == DataType.UNSUPPORTED) {
-            throw new IllegalArgumentException("declared type [" + type + "] for column [" + column + "] is not a known type");
+        // PUT-time DeclaredSchemaValidator already rejects undeclarable types; this is the defensive backstop for a
+        // mapping that reached resolution another way (e.g. a hand-edited cluster state). Mirror the validator's
+        // whitelist exactly so the backstop is as strict — a known-but-non-declarable type (e.g. geo_point) is rejected
+        // here too, not just an unknown one.
+        if (resolved == DataType.UNSUPPORTED || DeclaredSchemaValidator.DECLARABLE_TYPES.contains(resolved) == false) {
+            throw new IllegalArgumentException("declared type [" + type + "] for column [" + column + "] is not a declarable type");
         }
         return resolved;
     }

@@ -532,6 +532,9 @@ public class ExternalSourceResolver {
         DatasetMapping declaredMapping
     ) throws Exception {
         FileList listing;
+        // Strict multi-file still does the same glob listing as the inferred path — record it as discovery too, so
+        // strict resolutions are not invisible in the discovery telemetry (mirrors resolveMultiFileSource).
+        long discoveryStartNanos = System.nanoTime();
         if (path.indexOf(',') >= 0) {
             int maxDiscoveredFiles = ExternalSourceSettings.MAX_DISCOVERED_FILES.get(settings);
             int maxGlobExpansion = ExternalSourceSettings.MAX_GLOB_EXPANSION.get(settings);
@@ -545,6 +548,7 @@ public class ExternalSourceResolver {
         } else {
             listing = expandAndCompact(path, provider, hints, hivePartitioning, storagePath);
         }
+        recordDiscovery(listing, discoveryStartNanos, storagePath.scheme());
         if (listing.fileCount() == 0) {
             throw new IllegalArgumentException("Glob pattern matched no files: " + path);
         }

@@ -1295,7 +1295,18 @@ public class CsvFormatReader implements SegmentableFormatReader {
                 // The schema was supplied from OUTSIDE the file (a declared mapping) and binds positionally — the
                 // header is otherwise ignored, so a declaration whose order disagrees with the file would silently
                 // read the wrong columns. Cross-check the header names instead of blindly skipping the line.
-                validateDeclaredHeaderBinding(consumeHeaderLine(recordReader), readSchema, object);
+                // This throws BEFORE ownership of the stream chain transfers to the returned iterator, so the
+                // reader must be closed here — otherwise the file handle leaks (caught by LeakFS in CI).
+                try {
+                    validateDeclaredHeaderBinding(consumeHeaderLine(recordReader), readSchema, object);
+                } catch (Exception e) {
+                    try {
+                        reader.close();
+                    } catch (IOException suppressed) {
+                        e.addSuppressed(suppressed);
+                    }
+                    throw e;
+                }
             }
             effectiveSchema = readSchema;
         } else if (context.firstSplit()) {

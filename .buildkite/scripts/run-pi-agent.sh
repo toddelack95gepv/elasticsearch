@@ -76,6 +76,7 @@ Session is initialising…" \
 # Only SESSION_DIR is dynamic at runtime and must stay here as a CLI flag.
 NONO_ARGS=(
   --profile "${HOME}/.local/pi-agent/nono-pi-agent.json"
+  --allow-cwd                # required in non-interactive mode (--startup-timeout 0) even when profile has workdir.access=readwrite
   --allow "${SESSION_DIR}"   # runtime path for JSONL session snapshots; not known at profile-authoring time
   --startup-timeout 0        # non-interactive — skip TUI-readiness check
   --silent                   # suppress nono banner/summary in CI logs

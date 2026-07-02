@@ -188,7 +188,11 @@ public class FromDatasetIT extends AbstractEsqlIntegTestCase {
         "employees_copy_multi",
         "employees_swap",
         "employees_id_from_col",
-        "employees_id_bad_path"
+        "employees_id_bad_path",
+        "employees_id_renamed",
+        "employees_strict_hive",
+        "employees_strict_hive_collide",
+        "employees_parquet_type_conflict"
     );
 
     /**
@@ -852,6 +856,40 @@ public class FromDatasetIT extends AbstractEsqlIntegTestCase {
                 )
             )
         );
+    }
+
+    public void testDeclaredTypeConflictingWithPhysicalParquetTypeRejected() throws Exception {
+        // Parquet columns carry their own type — a declared retype can't change what the reader emits, so a declared
+        // type that differs from the file's is rejected at resolution with an actionable message (previously it died
+        // deep in the engine with an internal block-type mismatch). Casting a columnar column is a later increment.
+        Path parquet = writeParquetRenameFixture();
+        assertAcked(client().execute(PutDataSourceAction.INSTANCE, putDataSourceRequest("local_ds", Map.of())));
+        java.util.Map<String, DatasetFieldMapping> properties = new java.util.LinkedHashMap<>();
+        properties.put("emp_no", new DatasetFieldMapping("keyword", null)); // physical int64!
+        properties.put("first_name", new DatasetFieldMapping("keyword", null));
+        DatasetMapping mapping = new DatasetMapping(new DatasetMapping.Mappings(DatasetMapping.Dynamic.TRUE, properties));
+        assertAcked(
+            client().execute(
+                PutDatasetAction.INSTANCE,
+                new PutDatasetAction.Request(
+                    TIMEOUT,
+                    TIMEOUT,
+                    "employees_parquet_type_conflict",
+                    "local_ds",
+                    parquet.toUri().toString(),
+                    null,
+                    new HashMap<>(Map.of("format", "parquet")),
+                    mapping
+                )
+            )
+        );
+        Exception e = expectThrows(
+            Exception.class,
+            () -> run(syncEsqlQueryRequest("FROM employees_parquet_type_conflict | SORT first_name | LIMIT 5"), TIMEOUT).close()
+        );
+        assertThat(e.getMessage(), containsString("does not match the file's type"));
+        assertThat(e.getMessage(), containsString("emp_no"));
+        assertThat(e.getMessage(), containsString("long"));
     }
 
     private Path writeParquetRenameFixture() throws IOException {
@@ -1744,6 +1782,121 @@ public class FromDatasetIT extends AbstractEsqlIntegTestCase {
             assertThat(rows.get(2).get(0), equalTo(3));
             assertThat(rows.get(2).get(1).toString(), equalTo("Carol"));
         }
+    }
+
+    public void testIdFromRenamedColumn() throws Exception {
+        assertAcked(client().execute(PutDataSourceAction.INSTANCE, putDataSourceRequest("local_ds", Map.of())));
+        // The id-source is a LOGICAL name: declare uid as a rename of the physical first_name column and point
+        // _id.path at the logical uid. The whole chain (pin, projection, reader translation, stamp) must stay in
+        // logical space — _id equals the renamed column's values.
+        java.util.Map<String, DatasetFieldMapping> properties = new java.util.LinkedHashMap<>();
+        properties.put("uid", new DatasetFieldMapping("keyword", "first_name"));
+        DatasetMapping mapping = new DatasetMapping(new DatasetMapping.Mappings(DatasetMapping.Dynamic.TRUE, properties, null, "uid"));
+        assertAcked(
+            client().execute(
+                PutDatasetAction.INSTANCE,
+                new PutDatasetAction.Request(
+                    TIMEOUT,
+                    TIMEOUT,
+                    "employees_id_renamed",
+                    "local_ds",
+                    csvFixture.toUri().toString(),
+                    null,
+                    new HashMap<>(Map.of("format", "csv")),
+                    mapping
+                )
+            )
+        );
+        try (
+            var response = run(
+                syncEsqlQueryRequest("FROM employees_id_renamed METADATA _id | KEEP _id, uid | SORT uid | LIMIT 10"),
+                TIMEOUT
+            )
+        ) {
+            List<String> names = response.columns().stream().map(ColumnInfo::name).toList();
+            int idIdx = names.indexOf("_id");
+            int uidIdx = names.indexOf("uid");
+            List<List<Object>> rows = getValuesList(response);
+            assertThat(rows, hasSize(3));
+            for (List<Object> row : rows) {
+                assertThat("_id is stamped from the renamed column", row.get(idIdx), equalTo(row.get(uidIdx)));
+            }
+            assertThat(rows.get(0).get(uidIdx).toString(), equalTo("Alice"));
+        }
+    }
+
+    public void testStrictHivePartitionedGlob() throws Exception {
+        // Strict mode over a hive-partitioned layout: partition columns are path-derived (no file I/O), so the
+        // declaration-is-the-schema contract still surfaces them — typed and filterable — exactly like inference does.
+        Path root = createTempDir();
+        Path east = Files.createDirectories(root.resolve("region=east"));
+        Files.writeString(east.resolve("part1.csv"), "emp_no:integer,first_name:keyword\n1,Alice\n2,Bob\n");
+        Path west = Files.createDirectories(root.resolve("region=west"));
+        Files.writeString(west.resolve("part1.csv"), "emp_no:integer,first_name:keyword\n3,Carol\n");
+
+        assertAcked(client().execute(PutDataSourceAction.INSTANCE, putDataSourceRequest("local_ds", Map.of())));
+        java.util.Map<String, DatasetFieldMapping> strictProps = new java.util.LinkedHashMap<>();
+        strictProps.put("emp_no", new DatasetFieldMapping("integer", null));
+        strictProps.put("first_name", new DatasetFieldMapping("keyword", null));
+        DatasetMapping strictMapping = new DatasetMapping(new DatasetMapping.Mappings(DatasetMapping.Dynamic.FALSE, strictProps));
+        assertAcked(
+            client().execute(
+                PutDatasetAction.INSTANCE,
+                new PutDatasetAction.Request(
+                    TIMEOUT,
+                    TIMEOUT,
+                    "employees_strict_hive",
+                    "local_ds",
+                    root.toUri() + "**/*.csv",
+                    null,
+                    new HashMap<>(Map.of("format", "csv", "hive_partitioning", true)),
+                    strictMapping
+                )
+            )
+        );
+
+        // The partition column is queryable and filterable alongside the declared columns.
+        try (
+            var response = run(
+                syncEsqlQueryRequest(
+                    "FROM employees_strict_hive | WHERE region == \"east\" | SORT emp_no | KEEP emp_no, first_name, region"
+                ),
+                TIMEOUT
+            )
+        ) {
+            List<List<Object>> rows = getValuesList(response);
+            assertThat(rows, hasSize(2));
+            assertThat(rows.get(0).get(1).toString(), equalTo("Alice"));
+            assertThat(rows.get(1).get(1).toString(), equalTo("Bob"));
+            assertThat(rows.get(0).get(2).toString(), equalTo("east"));
+        }
+
+        // A declared column colliding with a partition key is rejected loudly (never silently shadowed — under
+        // strict, shadowing would re-bind the positional text columns).
+        java.util.Map<String, DatasetFieldMapping> colliding = new java.util.LinkedHashMap<>();
+        colliding.put("emp_no", new DatasetFieldMapping("integer", null));
+        colliding.put("region", new DatasetFieldMapping("keyword", null));
+        DatasetMapping collidingMapping = new DatasetMapping(new DatasetMapping.Mappings(DatasetMapping.Dynamic.FALSE, colliding));
+        assertAcked(
+            client().execute(
+                PutDatasetAction.INSTANCE,
+                new PutDatasetAction.Request(
+                    TIMEOUT,
+                    TIMEOUT,
+                    "employees_strict_hive_collide",
+                    "local_ds",
+                    root.toUri() + "**/*.csv",
+                    null,
+                    new HashMap<>(Map.of("format", "csv", "hive_partitioning", true)),
+                    collidingMapping
+                )
+            )
+        );
+        Exception e = expectThrows(
+            Exception.class,
+            () -> run(syncEsqlQueryRequest("FROM employees_strict_hive_collide | LIMIT 1"), TIMEOUT).close()
+        );
+        assertThat(e.getMessage(), containsString("collides with a partition column"));
     }
 
     public void testIdFromMissingColumnRejectedOnlyWhenIdRequested() throws Exception {

@@ -601,11 +601,61 @@ public class ExternalSourceResolver {
      * each per-file schema (lenient — a column may be absent from one file under union-by-name), preserving the
      * inferred stats/sourceMetadata and the per-file column mappings.
      */
+    /**
+     * Formats whose readers emit blocks in the FILE's own types (self-typed / columnar) rather than parsing text into
+     * whatever type the schema requests. For these, a declared retype cannot change what the reader produces — the
+     * declared type must equal the reconciled (inferred) type or the query would fail deep in the engine with a block
+     * type mismatch. Text formats (CSV/TSV/NDJSON) parse into the declared type, so they are absent here.
+     * TODO: this classification belongs on the {@code FormatReader} SPI (a capability method) — move it there with the
+     * typed DeclaredReadSpec carrier; a single documented constant beats threading a new SPI method for two formats.
+     */
+    private static final Set<String> FILE_TYPED_FORMATS = Set.of("parquet", "orc");
+
+    /**
+     * For a file-typed format, every declared column's type must equal the reconciled (inferred) type of the physical
+     * column it reads. The readers emit the file's own types; reconciliation already casts per file toward the unified
+     * type — so a matching declaration works by construction, and a differing one would surface as an internal block
+     * type mismatch deep in the engine. Reject it here, at resolution, with an actionable message instead. (Casting a
+     * columnar column to a different declared type is a natural later increment on this same seam.)
+     */
+    private static void rejectFileTypedRetypes(ExternalSourceMetadata inferred, DatasetMapping declaredMapping) {
+        Map<String, DataType> inferredTypes = new HashMap<>();
+        for (Attribute a : inferred.schema()) {
+            inferredTypes.put(a.name(), a.dataType());
+        }
+        for (Map.Entry<String, org.elasticsearch.cluster.metadata.DatasetFieldMapping> e : declaredMapping.mappings()
+            .properties()
+            .entrySet()) {
+            String physical = e.getValue().path() != null ? e.getValue().path() : e.getKey();
+            DataType inferredType = inferredTypes.get(physical);
+            if (inferredType == null) {
+                continue; // absence is handled by the overlay's own missing-column check
+            }
+            DataType declaredType = DataType.fromNameOrAlias(e.getValue().type());
+            if (declaredType != inferredType) {
+                throw new IllegalArgumentException(
+                    "declared type ["
+                        + e.getValue().type()
+                        + "] for column ["
+                        + e.getKey()
+                        + "] does not match the file's type ["
+                        + inferredType.typeName().toLowerCase(Locale.ROOT)
+                        + "] — ["
+                        + inferred.sourceType()
+                        + "] columns carry their own type; declare the file's type and cast in the query if needed"
+                );
+            }
+        }
+    }
+
     private ExternalSourceResolution.ResolvedSource applyNonStrictOverlay(
         ExternalSourceResolution.ResolvedSource resolved,
         DatasetMapping declaredMapping
     ) {
         final ExternalSourceMetadata inferred = resolved.metadata();
+        if (FILE_TYPED_FORMATS.contains(inferred.sourceType())) {
+            rejectFileTypedRetypes(inferred, declaredMapping);
+        }
         DeclaredSchemaResolver.Overlaid unified = DeclaredSchemaResolver.overlayNonStrict(inferred.schema(), declaredMapping, false);
         ExternalSourceMetadata overlaidMetadata = new ExternalSourceMetadata() {
             @Override

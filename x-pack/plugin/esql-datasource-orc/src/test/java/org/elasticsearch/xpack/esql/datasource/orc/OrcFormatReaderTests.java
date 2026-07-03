@@ -28,6 +28,7 @@ import org.apache.orc.OrcFile;
 import org.apache.orc.TypeDescription;
 import org.apache.orc.Writer;
 import org.elasticsearch.common.breaker.NoopCircuitBreaker;
+import org.elasticsearch.common.logging.HeaderWarning;
 import org.elasticsearch.common.time.DateFormatter;
 import org.elasticsearch.common.util.BigArrays;
 import org.elasticsearch.compute.data.BlockFactory;
@@ -46,6 +47,7 @@ import org.elasticsearch.xpack.esql.core.expression.Nullability;
 import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
+import org.elasticsearch.xpack.esql.core.util.StringUtils;
 import org.elasticsearch.xpack.esql.datasources.spi.ColumnExtractor;
 import org.elasticsearch.xpack.esql.datasources.spi.DeclaredTypeCoercions;
 import org.elasticsearch.xpack.esql.datasources.spi.ErrorPolicy;
@@ -55,6 +57,7 @@ import org.elasticsearch.xpack.esql.datasources.spi.RangeReadContext;
 import org.elasticsearch.xpack.esql.datasources.spi.SourceMetadata;
 import org.elasticsearch.xpack.esql.datasources.spi.StorageObject;
 import org.elasticsearch.xpack.esql.datasources.spi.StoragePath;
+import org.junit.After;
 
 import java.io.ByteArrayInputStream;
 import java.io.File;
@@ -1527,6 +1530,136 @@ public class OrcFormatReaderTests extends ESTestCase {
             assertEquals(7L, ((LongBlock) page.getBlock(0)).getLong(0));
             assertEquals(42L, ((LongBlock) page.getBlock(0)).getLong(1));
             page.releaseBlocks();
+        }
+    }
+
+    public void testLongToDoubleCoerces() throws Exception {
+        // A declared `double` on a BIGINT column coerces like bulk ingest of a long into a double field: the user
+        // declared it double, so the reader converts at decode time (values beyond 2^53 round exactly like ingest).
+        TypeDescription schema = TypeDescription.createStruct().addField("v", TypeDescription.createLong());
+        byte[] orcData = createOrcFile(schema, batch -> {
+            batch.size = 3;
+            LongColumnVector vCol = (LongColumnVector) batch.cols[0];
+            vCol.vector[0] = 1L;
+            vCol.vector[1] = -42L;
+            vCol.vector[2] = 9007199254740993L;
+        });
+        StorageObject storageObject = createStorageObject(orcData);
+        OrcFormatReader reader = new OrcFormatReader(blockFactory);
+        List<Attribute> plannerSchema = List.of(new ReferenceAttribute(Source.EMPTY, "v", DataType.DOUBLE));
+        try (
+            CloseableIterator<Page> it = reader.readRange(
+                storageObject,
+                new RangeReadContext(List.of("v"), 10, 0, orcData.length, plannerSchema, ErrorPolicy.STRICT)
+            )
+        ) {
+            Page page = it.next();
+            assertEquals(3, page.getPositionCount());
+            DoubleBlock doubles = (DoubleBlock) page.getBlock(0);
+            assertEquals(1.0, doubles.getDouble(0), 0.0);
+            assertEquals(-42.0, doubles.getDouble(1), 0.0);
+            assertEquals(9007199254740992.0, doubles.getDouble(2), 0.0);
+            page.releaseBlocks();
+        }
+    }
+
+    public void testStringToLongDoubleBooleanIpCoerces() throws Exception {
+        // Columnar string columns coerce into any declared type exactly like the text readers parse them — the
+        // mapper-ingest coercion set (string->long/double/boolean/ip), applied at decode via the shared castBlock.
+        TypeDescription schema = TypeDescription.createStruct()
+            .addField("s_long", TypeDescription.createString())
+            .addField("s_double", TypeDescription.createString())
+            .addField("s_bool", TypeDescription.createString())
+            .addField("s_ip", TypeDescription.createString());
+        byte[] orcData = createOrcFile(schema, batch -> {
+            batch.size = 1;
+            ((BytesColumnVector) batch.cols[0]).setVal(0, "42".getBytes(StandardCharsets.UTF_8));
+            ((BytesColumnVector) batch.cols[1]).setVal(0, "2.5".getBytes(StandardCharsets.UTF_8));
+            ((BytesColumnVector) batch.cols[2]).setVal(0, "true".getBytes(StandardCharsets.UTF_8));
+            ((BytesColumnVector) batch.cols[3]).setVal(0, "10.20.30.40".getBytes(StandardCharsets.UTF_8));
+        });
+        StorageObject storageObject = createStorageObject(orcData);
+        OrcFormatReader reader = new OrcFormatReader(blockFactory);
+        List<Attribute> plannerSchema = List.of(
+            new ReferenceAttribute(Source.EMPTY, "s_long", DataType.LONG),
+            new ReferenceAttribute(Source.EMPTY, "s_double", DataType.DOUBLE),
+            new ReferenceAttribute(Source.EMPTY, "s_bool", DataType.BOOLEAN),
+            new ReferenceAttribute(Source.EMPTY, "s_ip", DataType.IP)
+        );
+        try (
+            CloseableIterator<Page> it = reader.readRange(
+                storageObject,
+                new RangeReadContext(
+                    List.of("s_long", "s_double", "s_bool", "s_ip"),
+                    10,
+                    0,
+                    orcData.length,
+                    plannerSchema,
+                    ErrorPolicy.STRICT
+                )
+            )
+        ) {
+            Page page = it.next();
+            assertEquals(1, page.getPositionCount());
+            assertEquals(42L, ((LongBlock) page.getBlock(0)).getLong(0));
+            assertEquals(2.5, ((DoubleBlock) page.getBlock(1)).getDouble(0), 0.0);
+            assertTrue(((BooleanBlock) page.getBlock(2)).getBoolean(0));
+            assertEquals(StringUtils.parseIP("10.20.30.40"), ((BytesRefBlock) page.getBlock(3)).getBytesRef(0, new BytesRef()));
+            page.releaseBlocks();
+        }
+    }
+
+    public void testCoercionUnparseableValueEmitsWarningAndNull() throws Exception {
+        // Per-cell bulk leniency: a token the declared type cannot coerce nulls THAT cell and records a response
+        // Warning header — never a hard read failure, never a silent wrong value; the surrounding cells still decode.
+        TypeDescription schema = TypeDescription.createStruct().addField("n", TypeDescription.createString());
+        byte[] orcData = createOrcFile(schema, batch -> {
+            batch.size = 3;
+            ((BytesColumnVector) batch.cols[0]).setVal(0, "41".getBytes(StandardCharsets.UTF_8));
+            ((BytesColumnVector) batch.cols[0]).setVal(1, "oops".getBytes(StandardCharsets.UTF_8));
+            ((BytesColumnVector) batch.cols[0]).setVal(2, "43".getBytes(StandardCharsets.UTF_8));
+        });
+        StorageObject storageObject = createStorageObject(orcData);
+        OrcFormatReader reader = new OrcFormatReader(blockFactory);
+        List<Attribute> plannerSchema = List.of(new ReferenceAttribute(Source.EMPTY, "n", DataType.LONG));
+        try (
+            CloseableIterator<Page> it = reader.readRange(
+                storageObject,
+                new RangeReadContext(List.of("n"), 10, 0, orcData.length, plannerSchema, ErrorPolicy.STRICT)
+            )
+        ) {
+            Page page = it.next();
+            assertEquals(3, page.getPositionCount());
+            LongBlock longs = (LongBlock) page.getBlock(0);
+            assertEquals(41L, longs.getLong(longs.getFirstValueIndex(0)));
+            assertTrue("the unparseable cell reads as null", longs.isNull(1));
+            assertEquals(43L, longs.getLong(longs.getFirstValueIndex(2)));
+            page.releaseBlocks();
+        }
+        List<String> warnings = drainWarnings();
+        // 1 summary + 1 detail
+        assertEquals("Expected summary + 1 detail, got: " + warnings, 2, warnings.size());
+        assertTrue("Summary should mention coercion, got: " + warnings.get(0), warnings.get(0).contains("coerced"));
+        assertTrue("Detail should name the column, got: " + warnings.get(1), warnings.get(1).contains("[n]"));
+        assertTrue("Detail should name the declared type, got: " + warnings.get(1), warnings.get(1).contains("[long]"));
+    }
+
+    private List<String> drainWarnings() {
+        List<String> raw = threadContext.getResponseHeaders().getOrDefault("Warning", List.of());
+        List<String> messages = raw.stream().map(s -> HeaderWarning.extractWarningValueFromWarningHeader(s, false)).toList();
+        threadContext.stashContext();
+        return messages;
+    }
+
+    /**
+     * Coercion tests emit response Warning headers; drop any accumulated ones so the parent
+     * {@code ensureNoWarnings} post-check passes. Tests that assert on them call
+     * {@link #drainWarnings()} from inside the test method.
+     */
+    @After
+    public void clearWarningHeaders() {
+        if (threadContext != null) {
+            threadContext.stashContext();
         }
     }
 

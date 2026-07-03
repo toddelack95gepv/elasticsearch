@@ -1333,6 +1333,66 @@ public class FromDatasetIT extends AbstractEsqlIntegTestCase {
         assertThat(csvMs, equalTo(ACCESS_LOG_EPOCH_MILLIS));
     }
 
+    public void testStringToLongEquivalentAcrossTextAndColumnar() throws Exception {
+        // Same numeric token, read as a CSV token (text parse into the declared type) and as a Parquet BINARY value
+        // (columnar string->long coercion), produces the IDENTICAL long: text and columnar are the same idea — the
+        // file yields a string, the declaration says what it means.
+        assertAcked(client().execute(PutDataSourceAction.INSTANCE, putDataSourceRequest("local_ds", Map.of())));
+
+        Path csv = createTempFile("dataset-string-long-", ".csv");
+        Files.writeString(csv, "n:keyword\n42\n");
+        java.util.Map<String, DatasetFieldMapping> csvProps = new java.util.LinkedHashMap<>();
+        csvProps.put("n", new DatasetFieldMapping("long", null));
+        assertAcked(
+            client().execute(
+                PutDatasetAction.INSTANCE,
+                new PutDatasetAction.Request(
+                    TIMEOUT,
+                    TIMEOUT,
+                    "long_csv_equiv",
+                    "local_ds",
+                    csv.toUri().toString(),
+                    null,
+                    new HashMap<>(Map.of("format", "csv")),
+                    new DatasetMapping(new DatasetMapping.Mappings(DatasetMapping.Dynamic.FALSE, csvProps))
+                )
+            )
+        );
+
+        Path parquet = writeParquetTypedStringsFixture();
+        java.util.Map<String, DatasetFieldMapping> pqProps = new java.util.LinkedHashMap<>();
+        pqProps.put("id", new DatasetFieldMapping("long", null));
+        pqProps.put("n", new DatasetFieldMapping("long", "s_long"));
+        assertAcked(
+            client().execute(
+                PutDatasetAction.INSTANCE,
+                new PutDatasetAction.Request(
+                    TIMEOUT,
+                    TIMEOUT,
+                    "long_parquet_equiv",
+                    "local_ds",
+                    parquet.toUri().toString(),
+                    null,
+                    new HashMap<>(Map.of("format", "parquet")),
+                    new DatasetMapping(new DatasetMapping.Mappings(DatasetMapping.Dynamic.FALSE, pqProps))
+                )
+            )
+        );
+
+        long csvValue = readSingleLong("FROM long_csv_equiv | KEEP n | LIMIT 1");
+        long parquetValue = readSingleLong("FROM long_parquet_equiv | SORT id | KEEP n | LIMIT 1");
+        assertThat("text and columnar coerce the same token to the same long", parquetValue, equalTo(csvValue));
+        assertThat(csvValue, equalTo(42L));
+    }
+
+    private long readSingleLong(String query) {
+        try (var response = run(syncEsqlQueryRequest(query), TIMEOUT)) {
+            List<List<Object>> rows = getValuesList(response);
+            assertThat(rows, hasSize(1));
+            return (Long) rows.get(0).get(0);
+        }
+    }
+
     private long coerceStringDateToEpoch(String dataset) {
         try (var response = run(syncEsqlQueryRequest("FROM " + dataset + " | SORT ts | EVAL ms = ts::long | KEEP ms | LIMIT 1"), TIMEOUT)) {
             List<List<Object>> rows = getValuesList(response);
@@ -1376,11 +1436,11 @@ public class FromDatasetIT extends AbstractEsqlIntegTestCase {
 
     public void testStrictColumnarUncoercibleTypeRejected() throws Exception {
         // The no-silent-null guarantee holds: a declared type with NO read-time conversion from the physical type
-        // (int64 -> double is lossy, excluded from the coercion matrix) is rejected at resolution, not silently nulled.
+        // (a number has no ip form — even bulk ingest rejects it) is rejected at resolution, not silently nulled.
         assertAcked(client().execute(PutDataSourceAction.INSTANCE, putDataSourceRequest("local_ds", Map.of())));
         Path parquet = writeParquetRenameFixture();
         java.util.Map<String, DatasetFieldMapping> properties = new java.util.LinkedHashMap<>();
-        properties.put("id", new DatasetFieldMapping("double", "emp_no")); // physical int64 -> double: no coercion
+        properties.put("id", new DatasetFieldMapping("ip", "emp_no")); // physical int64 -> ip: no coercion
         DatasetMapping mapping = new DatasetMapping(new DatasetMapping.Mappings(DatasetMapping.Dynamic.FALSE, properties));
         assertAcked(
             client().execute(
@@ -1403,6 +1463,121 @@ public class FromDatasetIT extends AbstractEsqlIntegTestCase {
         );
         assertThat(e.getMessage(), containsString("no read-time conversion exists for this pair"));
         assertThat(e.getMessage(), containsString("id"));
+    }
+
+    public void testStrictColumnarLongToDoubleCoerces() throws Exception {
+        // "The user declared it double; they told us what they want": the physical int64 coerces long->double at read
+        // time, exactly like bulk ingest of a long into a double field. Pre-widening this pair was rejected.
+        assertAcked(client().execute(PutDataSourceAction.INSTANCE, putDataSourceRequest("local_ds", Map.of())));
+        Path parquet = writeParquetRenameFixture();
+        java.util.Map<String, DatasetFieldMapping> properties = new java.util.LinkedHashMap<>();
+        properties.put("id", new DatasetFieldMapping("double", "emp_no")); // physical int64 -> double coerce
+        DatasetMapping mapping = new DatasetMapping(new DatasetMapping.Mappings(DatasetMapping.Dynamic.FALSE, properties));
+        assertAcked(
+            client().execute(
+                PutDatasetAction.INSTANCE,
+                new PutDatasetAction.Request(
+                    TIMEOUT,
+                    TIMEOUT,
+                    "employees_long_to_double",
+                    "local_ds",
+                    parquet.toUri().toString(),
+                    null,
+                    new HashMap<>(Map.of("format", "parquet")),
+                    mapping
+                )
+            )
+        );
+        try (var response = run(syncEsqlQueryRequest("FROM employees_long_to_double | SORT id | KEEP id | LIMIT 10"), TIMEOUT)) {
+            List<List<Object>> rows = getValuesList(response);
+            assertThat(rows, hasSize(3));
+            assertThat(rows.get(0).get(0), equalTo(1.0));
+            assertThat(rows.get(1).get(0), equalTo(2.0));
+            assertThat(rows.get(2).get(0), equalTo(3.0));
+        }
+    }
+
+    public void testStrictColumnarStringColumnsCoerceToDeclaredTypes() throws Exception {
+        // Columnar string columns parse into any declared type — the same thing text formats do — and a token the
+        // declared type cannot coerce nulls THAT cell (bulk leniency), never failing the read or reading garbage.
+        assertAcked(client().execute(PutDataSourceAction.INSTANCE, putDataSourceRequest("local_ds", Map.of())));
+        Path parquet = writeParquetTypedStringsFixture();
+        java.util.Map<String, DatasetFieldMapping> properties = new java.util.LinkedHashMap<>();
+        properties.put("id", new DatasetFieldMapping("long", null));
+        properties.put("v_long", new DatasetFieldMapping("long", "s_long"));
+        properties.put("v_double", new DatasetFieldMapping("double", "s_double"));
+        properties.put("v_bool", new DatasetFieldMapping("boolean", "s_bool"));
+        properties.put("v_ip", new DatasetFieldMapping("ip", "s_ip"));
+        DatasetMapping mapping = new DatasetMapping(new DatasetMapping.Mappings(DatasetMapping.Dynamic.FALSE, properties));
+        assertAcked(
+            client().execute(
+                PutDatasetAction.INSTANCE,
+                new PutDatasetAction.Request(
+                    TIMEOUT,
+                    TIMEOUT,
+                    "typed_strings_parquet",
+                    "local_ds",
+                    parquet.toUri().toString(),
+                    null,
+                    new HashMap<>(Map.of("format", "parquet")),
+                    mapping
+                )
+            )
+        );
+        try (
+            var response = run(
+                syncEsqlQueryRequest("FROM typed_strings_parquet | SORT id | KEEP v_long, v_double, v_bool, v_ip | LIMIT 10"),
+                TIMEOUT
+            )
+        ) {
+            List<List<Object>> rows = getValuesList(response);
+            assertThat(rows, hasSize(2));
+            // row 1: every token parses into its declared type
+            assertThat(rows.get(0).get(0), equalTo(42L));
+            assertThat(rows.get(0).get(1), equalTo(2.5));
+            assertThat(rows.get(0).get(2), equalTo(true));
+            assertThat(rows.get(0).get(3), equalTo("10.20.30.40"));
+            // row 2: unparseable tokens null their cells only; the parseable boolean still reads
+            assertNull(rows.get(1).get(0));
+            assertNull(rows.get(1).get(1));
+            assertThat(rows.get(1).get(2), equalTo(false));
+            assertNull(rows.get(1).get(3));
+        }
+    }
+
+    private Path writeParquetTypedStringsFixture() throws IOException {
+        // String columns carrying typed tokens (row 1) and unparseable tokens (row 2, except the boolean).
+        MessageType schema = MessageTypeParser.parseMessageType(
+            "message typed { required int64 id; required binary s_long (UTF8); required binary s_double (UTF8);"
+                + " required binary s_bool (UTF8); required binary s_ip (UTF8); }"
+        );
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        SimpleGroupFactory factory = new SimpleGroupFactory(schema);
+        try (
+            ParquetWriter<Group> writer = ExampleParquetWriter.builder(createOutputFile(baos))
+                .withConf(new PlainParquetConfiguration())
+                .withType(schema)
+                .withCompressionCodec(CompressionCodecName.UNCOMPRESSED)
+                .build()
+        ) {
+            Group ok = factory.newGroup();
+            ok.add("id", 1L);
+            ok.add("s_long", "42");
+            ok.add("s_double", "2.5");
+            ok.add("s_bool", "true");
+            ok.add("s_ip", "10.20.30.40");
+            writer.write(ok);
+            Group bad = factory.newGroup();
+            bad.add("id", 2L);
+            bad.add("s_long", "not-a-long");
+            bad.add("s_double", "not-a-double");
+            bad.add("s_bool", "false");
+            bad.add("s_ip", "999.999.999.999");
+            writer.write(bad);
+        }
+        Path tempFile = createTempDir().resolve("typed_strings.parquet");
+        Files.write(tempFile, baos.toByteArray());
+        return tempFile;
     }
 
     public void testStrictColumnarLongToDatetimeCoercesMultiFile() throws Exception {

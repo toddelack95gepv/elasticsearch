@@ -1150,6 +1150,10 @@ public class OrcFormatReader implements RangeAwareFormatReader, NoConfigFormatRe
         private final DateFormatter[] declaredFormatters;
         /** Index of the synthetic {@code _rowPosition} attribute, or {@code -1} when not projected. */
         private final int rowPositionColumnIndex;
+        /** File location for warning/error messages. */
+        private final String fileLocation;
+        /** See {@link #coercionWarnings()}. */
+        private SkipWarnings coercionWarnings;
         /**
          * File-global row number of the first row in the current batch, captured from
          * {@link RecordReader#getRowNumber()} immediately before each {@code nextBatch}. ORC reports
@@ -1180,6 +1184,7 @@ public class OrcFormatReader implements RangeAwareFormatReader, NoConfigFormatRe
             this.counters = counters;
 
             this.rowPositionColumnIndex = SyntheticColumns.rowPositionIndexInAttributes(attributes);
+            this.fileLocation = fileLocation;
 
             this.fieldNameToPath = new HashMap<>(attributes.size());
             this.leafTypes = new TypeDescription[attributes.size()];
@@ -1425,7 +1430,7 @@ public class OrcFormatReader implements RangeAwareFormatReader, NoConfigFormatRe
                     if (vector == null) {
                         continue;
                     }
-                    blocks[col] = createBlock(vector, dataType, rowCount, ancestorNulls, leafTypes[col], declaredFormatters[col]);
+                    blocks[col] = createBlock(vector, dataType, rowCount, ancestorNulls, leafTypes[col], declaredFormatters[col], fieldName);
                 } catch (Exception e) {
                     Releasables.closeExpectNoException(blocks);
                     throw e;
@@ -1475,6 +1480,53 @@ public class OrcFormatReader implements RangeAwareFormatReader, NoConfigFormatRe
          * {@code >0} read the only meaningful slot ({@code 0}) rather than stale data.
          */
         private Block createBlock(
+            ColumnVector vector,
+            DataType dataType,
+            int rowCount,
+            BitSet ancestorNulls,
+            TypeDescription leafType,
+            DateFormatter dateFormatter,
+            String columnName
+        ) {
+            // Declared-type coercion beyond the fused pairs: decode the column (or LIST element)
+            // at the file's own type with the arms below, then coerce the block to the declared
+            // type (bulk-API leniency: an unconvertible value nulls its cell and emits a response
+            // Warning). Mirrors the Parquet readers so the two columnar formats cannot drift.
+            DataType fileType = leafType != null ? convertOrcTypeToEsql(leafType) : null;
+            if (fileType != null
+                && dataType != fileType
+                && DeclaredTypeCoercions.fusedInDecode(fileType, dataType) == false
+                && DeclaredTypeCoercions.supports(fileType, dataType)) {
+                Block physical = createBlockAs(vector, fileType, rowCount, ancestorNulls, leafType, dateFormatter);
+                try {
+                    return DeclaredTypeCoercions.castBlock(
+                        physical,
+                        fileType,
+                        dataType,
+                        dateFormatter,
+                        blockFactory,
+                        columnName,
+                        coercionWarnings()
+                    );
+                } finally {
+                    physical.close();
+                }
+            }
+            return createBlockAs(vector, dataType, rowCount, ancestorNulls, leafType, dateFormatter);
+        }
+
+        private SkipWarnings coercionWarnings() {
+            if (coercionWarnings == null) {
+                coercionWarnings = new SkipWarnings(
+                    "ORC file [" + fileLocation + "] has values that could not be coerced to the declared column type; "
+                        + "they are returned as null"
+                );
+            }
+            return coercionWarnings;
+        }
+
+        /** The physical decode arms; {@code dataType} is the type the block is decoded AS (see {@link #createBlock}). */
+        private Block createBlockAs(
             ColumnVector vector,
             DataType dataType,
             int rowCount,

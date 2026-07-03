@@ -293,6 +293,19 @@ public class DeclaredTypeCoercionsTests extends ESTestCase {
         }
     }
 
+    public void testCastIpToKeywordRendersAddressText() {
+        // An ip block holds the mapper's 16-byte encoded form; the only coercion out of ip is
+        // stringification, which must carry the address text — never the raw encoding bytes.
+        try (BytesRefBlock.Builder builder = blockFactory.newBytesRefBlockBuilder(1)) {
+            builder.appendBytesRef(StringUtils.parseIP("10.20.30.40"));
+            try (Block source = builder.build()) {
+                try (Block cast = castStrict(source, DataType.IP, DataType.KEYWORD)) {
+                    assertThat(((BytesRefBlock) cast).getBytesRef(0, new BytesRef()).utf8ToString(), equalTo("10.20.30.40"));
+                }
+            }
+        }
+    }
+
     public void testCastDatetimeToKeywordIsIso() {
         try (Block source = blockFactory.newLongArrayVector(new long[] { 971211336000L }, 1).asBlock()) {
             try (Block cast = castStrict(source, DataType.DATETIME, DataType.KEYWORD)) {

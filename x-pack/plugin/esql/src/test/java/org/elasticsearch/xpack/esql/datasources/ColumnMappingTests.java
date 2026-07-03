@@ -25,6 +25,7 @@ import org.elasticsearch.xpack.esql.core.expression.Nullability;
 import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
+import org.elasticsearch.xpack.esql.core.util.StringUtils;
 import org.elasticsearch.xpack.esql.datasources.spi.DeclaredTypeCoercions;
 import org.elasticsearch.xpack.esql.datasources.spi.SkipWarnings;
 import org.elasticsearch.xpack.esql.expression.predicate.operator.comparison.GreaterThan;
@@ -617,6 +618,27 @@ public class ColumnMappingTests extends ESTestCase {
             try {
                 BytesRefBlock returned = out.getBlock(0);
                 assertSame("KEYWORD → KEYWORD must be a ref-bumped passthrough, not a copy", src, returned);
+            } finally {
+                out.releaseBlocks();
+            }
+        } finally {
+            filePage.releaseBlocks();
+        }
+    }
+
+    public void testCastIpToKeywordStringifiesAddress() {
+        // UBN's KEYWORD fallback covers every cross-type pair, so an ip-typed file column can
+        // carry a KEYWORD cast slot (ip file vs keyword file). The stringification must emit the
+        // address text — TO_STRING(col) bytes — not the mapper's 16-byte encoded form the block
+        // physically holds (which the pre-unification passthrough leaked).
+        ColumnMapping mapping = new ColumnMapping(new int[] { 0 }, new DataType[] { DataType.KEYWORD });
+        BytesRefBlock src = blockFactory.newConstantBytesRefBlockWith(StringUtils.parseIP("10.20.30.40"), 1);
+        Page filePage = new Page(1, new Block[] { src });
+        try {
+            Page out = mapping.mapPage(filePage, blockFactory, new DataType[] { DataType.IP });
+            try {
+                BytesRefBlock result = out.getBlock(0);
+                assertEquals("10.20.30.40", result.getBytesRef(0, new BytesRef()).utf8ToString());
             } finally {
                 out.releaseBlocks();
             }

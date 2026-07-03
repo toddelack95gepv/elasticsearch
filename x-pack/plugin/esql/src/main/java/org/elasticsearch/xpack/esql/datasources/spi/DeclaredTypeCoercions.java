@@ -58,7 +58,7 @@ import java.util.function.IntFunction;
  *       decimals truncate toward zero on whole-number targets, out-of-range throws);</li>
  *   <li><b>string targets</b> ({@code keyword}/{@code text}): any scalar source — ingest
  *       stringifies the token (temporal sources render in the ISO form the default date format
- *       parses back);</li>
+ *       parses back; ip sources render as address text, never the encoded bytes);</li>
  *   <li><b>{@code boolean}</b>: string sources only ({@code "true"}/{@code "false"} via
  *       {@link Booleans#parseBoolean(String)}, the same strict-token primitive the boolean
  *       mapper delegates to — numbers do not ingest into a boolean field);</li>
@@ -301,8 +301,9 @@ public final class DeclaredTypeCoercions {
             case KEYWORD, TEXT -> switch (from) {
                 case DATETIME -> v -> EsqlDataTypeConverter.dateTimeToString((Long) v);
                 case DATE_NANOS -> v -> EsqlDataTypeConverter.nanoTimeToString((Long) v);
-                // the token text, as keyword ingest of a scalar sees it
-                case INTEGER, LONG, UNSIGNED_LONG, DOUBLE, BOOLEAN, KEYWORD, TEXT -> String::valueOf;
+                // the token text, as keyword ingest of a scalar sees it; ip sources arrive from
+                // the value reader already rendered as address text
+                case INTEGER, LONG, UNSIGNED_LONG, DOUBLE, BOOLEAN, KEYWORD, TEXT, IP -> String::valueOf;
                 default -> throw new IllegalArgumentException("cannot coerce from [" + from.typeName() + "] blocks");
             };
             case LONG -> v -> NumberFieldMapper.NumberType.LONG.parse(v, true);
@@ -371,6 +372,14 @@ public final class DeclaredTypeCoercions {
                 BytesRefBlock bytes = (BytesRefBlock) block;
                 BytesRef scratch = new BytesRef();
                 yield i -> bytes.getBytesRef(i, scratch).utf8ToString();
+            }
+            case IP -> {
+                // ip blocks hold the mapper's 16-byte encoded form; render the TO_STRING address
+                // text so string targets (the only coercion out of ip) carry the address, never
+                // the raw encoding bytes.
+                BytesRefBlock bytes = (BytesRefBlock) block;
+                BytesRef scratch = new BytesRef();
+                yield i -> EsqlDataTypeConverter.ipToString(bytes.getBytesRef(i, scratch));
             }
             default -> throw new IllegalArgumentException("cannot coerce from [" + from.typeName() + "] blocks");
         };

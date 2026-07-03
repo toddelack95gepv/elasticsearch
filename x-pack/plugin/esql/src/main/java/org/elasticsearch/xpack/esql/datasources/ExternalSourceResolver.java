@@ -475,8 +475,9 @@ public class ExternalSourceResolver {
      * requirement the inferred path has). Columnar formats are the one exception:
      * {@link #rejectStrictColumnarUncoercibleTypes} reads the footer (cached) to validate the declared types against
      * the file's own — a coercible pair (e.g. {@code int64} declared {@code datetime}) is coerced by the reader at
-     * decode time, an uncoercible one fails loud rather than yielding silent nulls. Both the user-facing output and the per-file schema carry
-     * the declared <b>logical</b> names (identity column mapping); a {@code path} rename is applied to physical only at
+     * decode time, an uncoercible one fails loud rather than yielding silent nulls. Both the user-facing output and the
+     * per-file schema carry the declared <b>logical</b> names (identity column mapping); a {@code path} rename is
+     * applied to physical only at
      * the reader boundary via {@link PhysicalNames}, so the operator and reconciliation stay in logical space.
      */
     private ExternalSourceResolution.ResolvedSource resolveStrictSingleFile(

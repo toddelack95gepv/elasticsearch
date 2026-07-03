@@ -18,6 +18,7 @@ import org.apache.parquet.io.PositionOutputStream;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.MessageTypeParser;
 import org.elasticsearch.ResourceNotFoundException;
+import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.cluster.metadata.DatasetFieldMapping;
 import org.elasticsearch.cluster.metadata.DatasetMapping;
 import org.elasticsearch.cluster.metadata.DatasetMetadata;
@@ -26,6 +27,7 @@ import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.test.ESIntegTestCase;
+import org.elasticsearch.transport.TransportService;
 import org.elasticsearch.xpack.core.esql.action.ColumnInfo;
 import org.elasticsearch.xpack.esql.action.EsqlCapabilities.Cap;
 import org.elasticsearch.xpack.esql.datasource.csv.CsvDataSourcePlugin;
@@ -56,11 +58,14 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;
 import static org.elasticsearch.xpack.esql.EsqlTestUtils.getValuesList;
 import static org.elasticsearch.xpack.esql.action.EsqlQueryRequest.syncEsqlQueryRequest;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.hasSize;
@@ -243,7 +248,10 @@ public class FromDatasetIT extends AbstractEsqlIntegTestCase {
         "long_csv_equiv",
         "long_parquet_equiv",
         "typed_strings_parquet",
-        "logs_deferred_coerce"
+        "logs_deferred_coerce",
+        "logs_bad_date_token",
+        "logs_bad_date_failfast",
+        "logs_csv_bad_date_failfast"
     );
 
     /**
@@ -1370,6 +1378,156 @@ public class FromDatasetIT extends AbstractEsqlIntegTestCase {
         Path tempFile = createTempDir().resolve("logs_deferred.parquet");
         Files.write(tempFile, baos.toByteArray());
         return tempFile;
+    }
+
+    /**
+     * Fixture for the bad-date-token tests: same 4-column shape as
+     * {@link #writeParquetDeferredCoerceFixture} (so the wide-projection TopN crosses the
+     * deferred-extraction threshold), but the pri=20 row's timestamp is an unparseable token.
+     */
+    private Path writeParquetBadDateTokenFixture() throws IOException {
+        MessageType schema = MessageTypeParser.parseMessageType(
+            "message logs { required int64 id; required int32 pri; required binary event_ts (UTF8); required binary msg (UTF8); }"
+        );
+        String[] timestamps = { "10/Oct/2000:13:55:36 -0700", "definitely-not-a-date", "10/Oct/2000:13:55:38 -0700" };
+        int[] pris = { 10, 20, 30 };
+        String[] msgs = { "alpha", "beta", "gamma" };
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        SimpleGroupFactory factory = new SimpleGroupFactory(schema);
+        try (
+            ParquetWriter<Group> writer = ExampleParquetWriter.builder(createOutputFile(baos))
+                .withConf(new PlainParquetConfiguration())
+                .withType(schema)
+                .withCompressionCodec(CompressionCodecName.UNCOMPRESSED)
+                .build()
+        ) {
+            for (int i = 0; i < timestamps.length; i++) {
+                Group g = factory.newGroup();
+                g.add("id", (long) (i + 1));
+                g.add("pri", pris[i]);
+                g.add("event_ts", timestamps[i]);
+                g.add("msg", msgs[i]);
+                writer.write(g);
+            }
+        }
+        Path tempFile = createTempDir().resolve("logs_bad_token.parquet");
+        Files.write(tempFile, baos.toByteArray());
+        return tempFile;
+    }
+
+    private void putBadDateTokenDataset(String name, Map<String, Object> extraSettings) throws Exception {
+        assertAcked(client().execute(PutDataSourceAction.INSTANCE, putDataSourceRequest("local_ds", Map.of())));
+        Path parquet = writeParquetBadDateTokenFixture();
+        java.util.Map<String, DatasetFieldMapping> properties = new java.util.LinkedHashMap<>();
+        properties.put("ts", new DatasetFieldMapping("date", "event_ts", List.of(), ACCESS_LOG_FORMAT));
+        properties.put("id_str", new DatasetFieldMapping("keyword", "id"));
+        properties.put("msg", new DatasetFieldMapping("keyword", null));
+        properties.put("pri", new DatasetFieldMapping("integer", null));
+        DatasetMapping mapping = new DatasetMapping(new DatasetMapping.Mappings(DatasetMapping.Dynamic.FALSE, properties));
+        HashMap<String, Object> settings = new HashMap<>(Map.of("format", "parquet"));
+        settings.putAll(extraSettings);
+        assertAcked(
+            client().execute(
+                PutDatasetAction.INSTANCE,
+                new PutDatasetAction.Request(TIMEOUT, TIMEOUT, name, "local_ds", parquet.toUri().toString(), null, settings, mapping)
+            )
+        );
+    }
+
+    public void testColumnarBadDateTokenNullsCellEagerAndDeferred() throws Exception {
+        // The fused string->datetime arm under the DEFAULT error policy: an unparseable token
+        // nulls THAT cell and the query SUCCEEDS — for BOTH plan shapes over the same cell. The
+        // eager KEEP decodes the coerced column in the forward scan; the wide-projection TopN
+        // defers it to ParquetColumnExtractor. Pre-fix the eager read hard-failed while the
+        // deferred one warned+nulled — same cell, opposite outcome by plan shape.
+        putBadDateTokenDataset("logs_bad_date_token", Map.of());
+
+        // Eager: one kept non-sort column stays under the deferred-extraction threshold.
+        try (var response = run(syncEsqlQueryRequest("FROM logs_bad_date_token | SORT pri | KEEP ts | LIMIT 10"), TIMEOUT)) {
+            List<List<Object>> rows = getValuesList(response);
+            assertThat(rows, hasSize(3));
+            assertThat(rows.get(0).get(0), equalTo("2000-10-10T20:55:36.000Z"));
+            assertThat("the bad token reads as null, not a thrown read", rows.get(1).get(0), equalTo(null));
+            assertThat(rows.get(2).get(0), equalTo("2000-10-10T20:55:38.000Z"));
+        }
+
+        // Deferred: same shape as testDeclaredCoercionsUnderDeferredExtraction — three kept
+        // non-sort columns cross DEFERRED_COLUMN_MIN, so ts materializes via the extractor.
+        try (
+            var response = run(syncEsqlQueryRequest("FROM logs_bad_date_token | SORT pri DESC | KEEP ts, id_str, msg | LIMIT 2"), TIMEOUT)
+        ) {
+            List<List<Object>> rows = getValuesList(response);
+            assertThat(rows, hasSize(2));
+            assertThat(rows.get(0).get(0), equalTo("2000-10-10T20:55:38.000Z")); // pri 30
+            assertThat(rows.get(0).get(2).toString(), equalTo("gamma"));
+            assertThat("the bad token reads as null under deferred extraction too", rows.get(1).get(0), equalTo(null)); // pri 20
+            assertThat(rows.get(1).get(2).toString(), equalTo("beta"));
+        }
+
+        // The nulled cell must be announced: re-run the eager query and read the coordinator's
+        // accumulated response Warning headers at completion (same probe as
+        // ExternalCsvHivePartitionedIT — the transport client owns the response ref-count, so the
+        // listener only inspects headers).
+        List<String> coercionWarnings = new CopyOnWriteArrayList<>();
+        CountDownLatch latch = new CountDownLatch(1);
+        client().execute(
+            EsqlQueryAction.INSTANCE,
+            syncEsqlQueryRequest("FROM logs_bad_date_token | SORT pri | KEEP ts | LIMIT 10"),
+            ActionListener.running(() -> {
+                try {
+                    internalCluster().getInstance(TransportService.class)
+                        .getThreadPool()
+                        .getThreadContext()
+                        .getResponseHeaders()
+                        .getOrDefault("Warning", List.of())
+                        .stream()
+                        .filter(w -> w.contains("could not be coerced to the declared column type"))
+                        .forEach(coercionWarnings::add);
+                } finally {
+                    latch.countDown();
+                }
+            })
+        );
+        assertTrue("query did not complete within timeout", latch.await(30, java.util.concurrent.TimeUnit.SECONDS));
+        assertThat("the nulled cell must emit a response Warning header", coercionWarnings, not(empty()));
+    }
+
+    public void testColumnarBadDateTokenFailFastFailsQueryMatchingCsv() throws Exception {
+        // error_mode: fail_fast routes the same coercion failure to a query abort — on parquet
+        // exactly as on CSV, where the same declared date + bad token has always failed the read.
+        putBadDateTokenDataset("logs_bad_date_failfast", Map.of("error_mode", "fail_fast"));
+        Exception parquetFailure = expectThrows(
+            Exception.class,
+            () -> run(syncEsqlQueryRequest("FROM logs_bad_date_failfast | SORT pri | KEEP ts | LIMIT 10"), TIMEOUT).close()
+        );
+        assertThat(parquetFailure.getMessage(), containsString("definitely-not-a-date"));
+
+        // CSV leg: same declared coercion, same bad token, same explicit policy -> same outcome.
+        Path csv = createTempFile("dataset-bad-date-", ".csv");
+        Files.writeString(csv, "ts:keyword,note:keyword\ndefinitely-not-a-date,alpha\n");
+        java.util.Map<String, DatasetFieldMapping> csvProps = new java.util.LinkedHashMap<>();
+        csvProps.put("ts", new DatasetFieldMapping("date", null, List.of(), ACCESS_LOG_FORMAT));
+        csvProps.put("note", new DatasetFieldMapping("keyword", null));
+        assertAcked(
+            client().execute(
+                PutDatasetAction.INSTANCE,
+                new PutDatasetAction.Request(
+                    TIMEOUT,
+                    TIMEOUT,
+                    "logs_csv_bad_date_failfast",
+                    "local_ds",
+                    csv.toUri().toString(),
+                    null,
+                    new HashMap<>(Map.of("format", "csv", "error_mode", "fail_fast")),
+                    new DatasetMapping(new DatasetMapping.Mappings(DatasetMapping.Dynamic.FALSE, csvProps))
+                )
+            )
+        );
+        Exception csvFailure = expectThrows(
+            Exception.class,
+            () -> run(syncEsqlQueryRequest("FROM logs_csv_bad_date_failfast | KEEP ts | LIMIT 10"), TIMEOUT).close()
+        );
+        assertThat(csvFailure.getMessage(), containsString("definitely-not-a-date"));
     }
 
     public void testStringToDatetimeEquivalentAcrossTextAndColumnar() throws Exception {

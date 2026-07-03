@@ -212,9 +212,7 @@ public class DeclaredTypeCoercionsTests extends ESTestCase {
     public void testCastStringToDatetimeHonorsDeclaredFormat() {
         DateFormatter fmt = DateFormatter.forPattern("dd/MMM/yyyy:HH:mm:ss Z");
         try (Block source = bytesBlock("10/Oct/2000:13:55:36 -0700")) {
-            try (
-                Block cast = DeclaredTypeCoercions.castBlock(source, DataType.KEYWORD, DataType.DATETIME, fmt, blockFactory, null, null)
-            ) {
+            try (Block cast = DeclaredTypeCoercions.castBlock(source, DataType.KEYWORD, DataType.DATETIME, fmt, blockFactory, null, null)) {
                 assertThat(((LongBlock) cast).getLong(0), equalTo(971211336000L));
             }
         }
@@ -226,9 +224,7 @@ public class DeclaredTypeCoercionsTests extends ESTestCase {
         List<String> warnings = new ArrayList<>();
         SkipWarnings sink = capturing(warnings);
         try (Block source = bytesBlock("41", "not-a-number", "43")) {
-            try (
-                Block cast = DeclaredTypeCoercions.castBlock(source, DataType.KEYWORD, DataType.LONG, null, blockFactory, "col", sink)
-            ) {
+            try (Block cast = DeclaredTypeCoercions.castBlock(source, DataType.KEYWORD, DataType.LONG, null, blockFactory, "col", sink)) {
                 LongBlock longs = (LongBlock) cast;
                 assertThat(longs.getLong(longs.getFirstValueIndex(0)), equalTo(41L));
                 assertTrue("the bad cell is null, not a wrong value and not a failure", longs.isNull(1));
@@ -245,9 +241,7 @@ public class DeclaredTypeCoercionsTests extends ESTestCase {
         List<String> warnings = new ArrayList<>();
         SkipWarnings sink = capturing(warnings);
         try (Block source = blockFactory.newLongArrayVector(new long[] { 7L, Long.MAX_VALUE }, 2).asBlock()) {
-            try (
-                Block cast = DeclaredTypeCoercions.castBlock(source, DataType.LONG, DataType.INTEGER, null, blockFactory, "col", sink)
-            ) {
+            try (Block cast = DeclaredTypeCoercions.castBlock(source, DataType.LONG, DataType.INTEGER, null, blockFactory, "col", sink)) {
                 assertThat(((org.elasticsearch.compute.data.IntBlock) cast).getInt(0), equalTo(7));
                 assertTrue("out-of-range narrows to null, never truncates silently", cast.isNull(1));
             }

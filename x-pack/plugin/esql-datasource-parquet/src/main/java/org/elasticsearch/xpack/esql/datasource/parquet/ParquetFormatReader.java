@@ -41,6 +41,7 @@ import org.elasticsearch.compute.data.BlockFactory;
 import org.elasticsearch.compute.data.Page;
 import org.elasticsearch.compute.data.UninitializedArrays;
 import org.elasticsearch.compute.operator.CloseableIterator;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.Releasables;
 import org.elasticsearch.logging.LogManager;
 import org.elasticsearch.logging.Logger;
@@ -155,6 +156,19 @@ public class ParquetFormatReader implements RangeAwareFormatReader, ColumnExtrac
      */
     PlainCompressionCodecFactory codecFactory() {
         return codecFactory;
+    }
+
+    /**
+     * Declared date parse pattern for one physical column, resolved to a {@link DateFormatter} —
+     * the same formatter {@link #buildColumnInfos} hands the eager decode paths. Package-private
+     * for {@link ParquetColumnExtractor}, whose deferred string&rarr;datetime coercion must parse
+     * with the column's declared {@code format} rather than the ISO default. Returns {@code null}
+     * when the column has no declared format.
+     */
+    @Nullable
+    DateFormatter declaredDateFormatterFor(String physicalColumnName) {
+        String pattern = declaredDateFormats.get(physicalColumnName);
+        return pattern == null ? null : DateFormatter.forPattern(pattern);
     }
 
     /**
@@ -1976,7 +1990,9 @@ public class ParquetFormatReader implements RangeAwareFormatReader, ColumnExtrac
         private SkipWarnings coercionWarnings() {
             if (coercionWarnings == null) {
                 coercionWarnings = new SkipWarnings(
-                    "Parquet file [" + fileLocation + "] has values that could not be coerced to the declared column type; "
+                    "Parquet file ["
+                        + fileLocation
+                        + "] has values that could not be coerced to the declared column type; "
                         + "they are returned as null"
                 );
             }

@@ -121,7 +121,24 @@ public class DeclaredSchemaValidatorTests extends ESTestCase {
         DeclaredSchemaValidator.validate(
             mapping(
                 Dynamic.TRUE,
-                props("a", "keyword", "b", "long", "c", "integer", "d", "double", "e", "boolean", "f", "date", "g", "unsigned_long", "h", "ip"),
+                props(
+                    "a",
+                    "keyword",
+                    "b",
+                    "long",
+                    "c",
+                    "integer",
+                    "d",
+                    "double",
+                    "e",
+                    "boolean",
+                    "f",
+                    "date",
+                    "g",
+                    "unsigned_long",
+                    "h",
+                    "ip"
+                ),
                 null
             )
         );

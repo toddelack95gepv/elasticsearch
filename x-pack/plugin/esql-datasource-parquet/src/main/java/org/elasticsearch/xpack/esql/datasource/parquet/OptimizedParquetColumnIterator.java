@@ -2254,7 +2254,9 @@ final class OptimizedParquetColumnIterator implements CloseableIterator<Page>, C
     private SkipWarnings coercionWarnings() {
         if (coercionWarnings == null) {
             coercionWarnings = new SkipWarnings(
-                "Parquet file [" + fileLocation + "] has values that could not be coerced to the declared column type; "
+                "Parquet file ["
+                    + fileLocation
+                    + "] has values that could not be coerced to the declared column type; "
                     + "they are returned as null"
             );
         }

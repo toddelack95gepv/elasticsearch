@@ -1479,7 +1479,7 @@ public class FromDatasetIT extends AbstractEsqlIntegTestCase {
                 new PutDatasetAction.Request(
                     TIMEOUT,
                     TIMEOUT,
-                    "employees_long_to_double",
+                    "coerced_long_to_double",
                     "local_ds",
                     parquet.toUri().toString(),
                     null,
@@ -1488,7 +1488,7 @@ public class FromDatasetIT extends AbstractEsqlIntegTestCase {
                 )
             )
         );
-        try (var response = run(syncEsqlQueryRequest("FROM employees_long_to_double | SORT id | KEEP id | LIMIT 10"), TIMEOUT)) {
+        try (var response = run(syncEsqlQueryRequest("FROM coerced_long_to_double | SORT id | KEEP id | LIMIT 10"), TIMEOUT)) {
             List<List<Object>> rows = getValuesList(response);
             assertThat(rows, hasSize(3));
             assertThat(rows.get(0).get(0), equalTo(1.0));

@@ -685,14 +685,20 @@ public class LocalExecutionPlanner {
             }
         }
         List<String> deferredColumnNames = new ArrayList<>(exec.attributesToExtract().size());
+        // The declared/planner type per deferred column: extraction decodes the file's own type and
+        // coerces to this exactly like the eager decode paths (DeclaredTypeCoercions), so a coerced
+        // column reads the same whether it was scanned eagerly or materialized after TopN.
+        List<DataType> deferredColumnTypes = new ArrayList<>(exec.attributesToExtract().size());
         for (Attribute a : exec.attributesToExtract()) {
             deferredColumnNames.add(PhysicalNames.translate(a.name(), deferredRenames));
+            deferredColumnTypes.add(a.dataType());
         }
 
         ExternalFieldExtractOperator.Factory factory = new ExternalFieldExtractOperator.Factory(
             rowPositionChannel,
             passThroughChannels,
             deferredColumnNames,
+            deferredColumnTypes,
             capable::sourceExtractorsFor
         );
         return source.with(factory, newLayout);

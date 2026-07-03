@@ -511,7 +511,7 @@ public class ParquetColumnExtractorTests extends ESTestCase {
         int multiColumnReads;
         try (ColumnExtractor extractor = new ParquetColumnExtractor(multiSo, reader, fullFooter)) {
             multiSo.reads.clear();
-            Block[] blocks = extractor.extract(new String[] { "v_int", "v_long", "v_str" }, survivors, blockFactory);
+            Block[] blocks = extractor.extract(new String[] { "v_int", "v_long", "v_str" }, null, survivors, blockFactory);
             try {
                 assertEquals(3, blocks.length);
                 for (Block b : blocks) {
@@ -635,7 +635,7 @@ public class ParquetColumnExtractorTests extends ESTestCase {
 
             // Also validate that the per-column schema and projection are built
             // correctly when multiple dotted names are resolved in one pass.
-            Block[] blocks = extractor.extract(new String[] { "event.id", "event.action" }, positions, blockFactory);
+            Block[] blocks = extractor.extract(new String[] { "event.id", "event.action" }, null, positions, blockFactory);
             try {
                 IntBlock ints = (IntBlock) blocks[0];
                 BytesRefBlock strs = (BytesRefBlock) blocks[1];

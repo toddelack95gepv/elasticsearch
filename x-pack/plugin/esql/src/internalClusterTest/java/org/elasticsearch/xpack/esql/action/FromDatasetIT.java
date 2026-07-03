@@ -1282,6 +1282,89 @@ public class FromDatasetIT extends AbstractEsqlIntegTestCase {
         }
     }
 
+    public void testDeclaredCoercionsUnderDeferredExtraction() throws Exception {
+        // The deferred-extraction twin of the eager coercion tests: a TopN keeping >= DEFERRED_COLUMN_MIN (3) non-sort
+        // columns defers their extraction until after the top rows are chosen, so the coerced columns are materialized by
+        // ParquetColumnExtractor rather than the eager scan. Both routes run the one DeclaredTypeCoercions.castBlock, so
+        // the deferred read must produce identical values. The pairs are chosen to be block-representation-changing so a
+        // skipped coercion cannot pass by accident: string->datetime with a declared NON-ISO format (BytesRef -> long;
+        // the ISO default cannot parse the token, so falling back to it nulls the cell) and int64->keyword
+        // (long -> BytesRef).
+        assertAcked(client().execute(PutDataSourceAction.INSTANCE, putDataSourceRequest("local_ds", Map.of())));
+        Path parquet = writeParquetDeferredCoerceFixture();
+        java.util.Map<String, DatasetFieldMapping> properties = new java.util.LinkedHashMap<>();
+        properties.put("ts", new DatasetFieldMapping("date", "event_ts", List.of(), ACCESS_LOG_FORMAT));
+        properties.put("id_str", new DatasetFieldMapping("keyword", "id")); // physical int64 -> stringify
+        properties.put("msg", new DatasetFieldMapping("keyword", null));
+        properties.put("pri", new DatasetFieldMapping("integer", null));
+        DatasetMapping mapping = new DatasetMapping(new DatasetMapping.Mappings(DatasetMapping.Dynamic.FALSE, properties));
+        assertAcked(
+            client().execute(
+                PutDatasetAction.INSTANCE,
+                new PutDatasetAction.Request(
+                    TIMEOUT,
+                    TIMEOUT,
+                    "logs_deferred_coerce",
+                    "local_ds",
+                    parquet.toUri().toString(),
+                    null,
+                    new HashMap<>(Map.of("format", "parquet")),
+                    mapping
+                )
+            )
+        );
+        // Same query shape as testParquetRenameDeferredExtractionOnRenamedColumns — the shape proven to cross
+        // DEFERRED_COLUMN_MIN and defer the three kept non-sort columns.
+        try (
+            var response = run(syncEsqlQueryRequest("FROM logs_deferred_coerce | SORT pri DESC | KEEP ts, id_str, msg | LIMIT 2"), TIMEOUT)
+        ) {
+            List<List<Object>> rows = getValuesList(response);
+            assertThat(rows, hasSize(2));
+            // pri 30 -> id 3, second 38 of the access-log minute; pri 20 -> id 2, second 37 (13:55 -0700 == 20:55Z).
+            assertThat(rows.get(0).get(0), equalTo("2000-10-10T20:55:38.000Z"));
+            assertThat(rows.get(0).get(1).toString(), equalTo("3"));
+            assertThat(rows.get(0).get(2).toString(), equalTo("gamma"));
+            assertThat(rows.get(1).get(0), equalTo("2000-10-10T20:55:37.000Z"));
+            assertThat(rows.get(1).get(1).toString(), equalTo("2"));
+            assertThat(rows.get(1).get(2).toString(), equalTo("beta"));
+        }
+    }
+
+    /**
+     * Fixture for {@link #testDeclaredCoercionsUnderDeferredExtraction}: four columns so a TopN keeping three non-sort
+     * columns crosses the deferred-extraction threshold, with an access-log date string (declared-format coerce) and an
+     * int64 id (stringify coerce) among the deferred columns. Rows are seconds 36/37/38 of the shared access-log minute.
+     */
+    private Path writeParquetDeferredCoerceFixture() throws IOException {
+        MessageType schema = MessageTypeParser.parseMessageType(
+            "message logs { required int64 id; required int32 pri; required binary event_ts (UTF8); required binary msg (UTF8); }"
+        );
+        String[] timestamps = { "10/Oct/2000:13:55:36 -0700", "10/Oct/2000:13:55:37 -0700", "10/Oct/2000:13:55:38 -0700" };
+        int[] pris = { 10, 20, 30 };
+        String[] msgs = { "alpha", "beta", "gamma" };
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        SimpleGroupFactory factory = new SimpleGroupFactory(schema);
+        try (
+            ParquetWriter<Group> writer = ExampleParquetWriter.builder(createOutputFile(baos))
+                .withConf(new PlainParquetConfiguration())
+                .withType(schema)
+                .withCompressionCodec(CompressionCodecName.UNCOMPRESSED)
+                .build()
+        ) {
+            for (int i = 0; i < timestamps.length; i++) {
+                Group g = factory.newGroup();
+                g.add("id", (long) (i + 1));
+                g.add("pri", pris[i]);
+                g.add("event_ts", timestamps[i]);
+                g.add("msg", msgs[i]);
+                writer.write(g);
+            }
+        }
+        Path tempFile = createTempDir().resolve("logs_deferred.parquet");
+        Files.write(tempFile, baos.toByteArray());
+        return tempFile;
+    }
+
     public void testStringToDatetimeEquivalentAcrossTextAndColumnar() throws Exception {
         // DIRECT text<->columnar consistency: the SAME date string + declared format, read as a CSV token (text parse)
         // and as a Parquet BINARY value (columnar string->date coerce), produces the IDENTICAL instant — because both

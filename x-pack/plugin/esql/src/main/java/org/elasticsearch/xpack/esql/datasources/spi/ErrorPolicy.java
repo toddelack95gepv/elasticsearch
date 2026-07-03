@@ -94,6 +94,15 @@ public record ErrorPolicy(Mode mode, long maxErrors, double maxErrorRatio, boole
     /** Skip all malformed rows without limit, logging each one. */
     public static final ErrorPolicy LENIENT = new ErrorPolicy(Mode.SKIP_ROW, Long.MAX_VALUE, 1.0, true);
 
+    /**
+     * Null-fill unparseable fields without limit, keeping every row. The columnar formats'
+     * (Parquet, ORC) default: their only per-value errors are declared-type coercion failures,
+     * which null the cell and emit a response {@code Warning} header unless the user opts into
+     * {@code error_mode: fail_fast}. A columnar batch cannot drop a single row, so
+     * {@link Mode#SKIP_ROW} degrades to this same null-field behavior there.
+     */
+    public static final ErrorPolicy PERMISSIVE = new ErrorPolicy(Mode.NULL_FIELD, Long.MAX_VALUE, 1.0, false);
+
     /** Config keys recognised by {@link #fromConfig}. Mirrored as constants so format
      *  plugins do not have to hard-code the strings. */
     public static final String CONFIG_MAX_ERRORS = "max_errors";

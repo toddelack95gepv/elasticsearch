@@ -206,6 +206,18 @@ public class DeclaredTypeCoercionsTests extends ESTestCase {
         assertTrue("datetime->long reads epoch millis", DeclaredTypeCoercions.supports(DataType.DATETIME, DataType.LONG));
     }
 
+    /**
+     * String targets are closed over the decodable source set: a type the readers have no value
+     * reader for (version, geo_point, ...) must be rejected by {@code supports} rather than
+     * admitted and then hard-thrown inside {@code castBlock}'s value reader.
+     */
+    public void testStringTargetsClosedOverDecodableSources() {
+        for (DataType to : List.of(DataType.KEYWORD, DataType.TEXT)) {
+            assertFalse("version blocks have no value reader", DeclaredTypeCoercions.supports(DataType.VERSION, to));
+            assertFalse("geo_point blocks have no value reader", DeclaredTypeCoercions.supports(DataType.GEO_POINT, to));
+        }
+    }
+
     /** Pairs even ingest cannot coerce — the resolver's reject path stays reachable through these. */
     public void testInconvertiblePairsRejected() {
         assertFalse("timestamp->ip has no ingest coercion", DeclaredTypeCoercions.supports(DataType.DATETIME, DataType.IP));

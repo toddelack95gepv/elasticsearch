@@ -42,23 +42,30 @@ import java.util.function.IntFunction;
  * (Hive/Trino-style: the declaration is the table schema, readers coerce toward it). Reading a
  * file value against a declared column is the same operation as indexing a document field
  * against a mapping, so the coercion authority is the field mappers' lenient index-time
- * coercion — the bulk-API behavior ({@code "123"} &rarr; {@code long},
- * {@code long} &rarr; {@code double}, {@code string} &rarr; {@code datetime} via the column's
- * declared {@code format}, &hellip;), not ES|QL's query-cast rules. Once a value has been
- * coerced into the declared shape it is an ordinary ES|QL value and query-layer conversions
- * ({@code ::}, {@code TO_*}) apply downstream as usual.
+ * coercion ({@code "123"} &rarr; {@code long}, {@code long} &rarr; {@code double},
+ * {@code string} &rarr; {@code datetime} via the column's declared {@code format}, &hellip;),
+ * not ES|QL's query-cast rules. Once a value has been coerced into the declared shape it is an
+ * ordinary ES|QL value and query-layer conversions ({@code ::}, {@code TO_*}) apply downstream
+ * as usual.
  *
  * <h2>What is coercible — the mapper coercion set</h2>
- * {@link #supports} mirrors what the field mappers accept at ingest:
+ * {@link #supports} follows what the field mappers accept at ingest, deviating on the safe
+ * (reject) side where a mapper is more permissive than a reader can be faithful to — the date
+ * mapper's default format also parses numeric and fractional tokens ({@code epoch_millis} halves
+ * a {@code 1.5} token down to a truncated instant), while {@code supports(DOUBLE, DATETIME)} is
+ * deliberately {@code false} because a fractional value has no unambiguous epoch reading:
  * <ul>
  *   <li><b>numeric targets</b> ({@code integer}/{@code long}/{@code double}/
  *       {@code unsigned_long}): any numeric or string source, with the exact
  *       {@link NumberFieldMapper.NumberType#parse(Object, boolean) NumberType.parse} semantics
  *       ({@code coerce=true}, the {@code index.mapping.coerce} default: numeric strings parse,
  *       decimals truncate toward zero on whole-number targets, out-of-range throws);</li>
- *   <li><b>string targets</b> ({@code keyword}/{@code text}): any scalar source — ingest
- *       stringifies the token (temporal sources render in the ISO form the default date format
- *       parses back; ip sources render as address text, never the encoded bytes);</li>
+ *   <li><b>string targets</b> ({@code keyword}/{@code text}): any decodable scalar source —
+ *       ingest stringifies the token (temporal sources render in the ISO form the default date
+ *       format parses back; ip sources render as address text, never the encoded bytes). The
+ *       source set is closed over exactly the types the readers can decode a block of (string,
+ *       whole-number, double, boolean, temporal, ip) so a pair {@code supports} admits can never
+ *       reach a value reader that has no arm for it;</li>
  *   <li><b>{@code boolean}</b>: string sources only ({@code "true"}/{@code "false"} via
  *       {@link Booleans#parseBoolean(String)}, the same strict-token primitive the boolean
  *       mapper delegates to — numbers do not ingest into a boolean field);</li>
@@ -84,10 +91,15 @@ import java.util.function.IntFunction;
  *       footer, so {@code ExternalSourceResolver} runs {@link #supports} once at resolution and
  *       fails fast. The readers fuse a handful of pairs directly into their decode loops
  *       ({@link #fusedInDecode}); every other supported pair decodes the column at the file's
- *       own type and coerces it with {@link #castBlock} — per-value failures (numeric overflow,
- *       an unparseable token) null the cell and emit a response {@code Warning} header, bulk-API
- *       style, instead of failing the read or decoding garbage. Readers also re-check
- *       {@link #supports} per file, since a multi-file glob can drift from the anchor footer.</li>
+ *       own type and coerces it with {@link #castBlock}. Per-value failures (numeric overflow,
+ *       an unparseable token) follow the read's {@link ErrorPolicy} the same way the text
+ *       readers' parse failures do — the default ({@code null_field}; {@code skip_row} degrades
+ *       to it, a columnar batch cannot drop one row) nulls the cell and emits a response
+ *       {@code Warning} header, {@code ignore_malformed}-style, while {@code fail_fast} fails
+ *       the read on the first bad value. Fused arms and {@link #castBlock} route the failure
+ *       through the one {@link #onCoercionFailure} chokepoint so the two paths cannot disagree.
+ *       Readers also re-check {@link #supports} per file, since a multi-file glob can drift from
+ *       the anchor footer.</li>
  *   <li><b>Text formats</b> (CSV/TSV, NDJSON) have no physical schema — every value is a string,
  *       so the parse into the declared type <i>is</i> the coercion and a bad token follows the
  *       reader's own per-value error policy. Their declared date {@code format} parse goes
@@ -130,7 +142,10 @@ public final class DeclaredTypeCoercions {
             || from == DataType.DATE_NANOS;
         boolean fromNumeric = fromWholeNumber || from == DataType.DOUBLE;
         return switch (to) {
-            case KEYWORD, TEXT -> true; // ingest stringifies any scalar token
+            // Ingest stringifies any scalar token, but the set is closed over the sources the
+            // readers can decode a block of (valueReader's arms) — an open-world `true` would
+            // admit pairs like version->keyword that then hard-throw inside castBlock.
+            case KEYWORD, TEXT -> fromString || fromNumeric || from == DataType.BOOLEAN || from == DataType.IP;
             case LONG, INTEGER, DOUBLE, UNSIGNED_LONG -> fromString || fromNumeric;
             case BOOLEAN -> fromString; // the boolean mapper accepts only true/false tokens, never numbers
             // Epoch-millis reinterpret for whole numbers; a nanos payload is NOT millis, so
@@ -227,7 +242,7 @@ public final class DeclaredTypeCoercions {
                     try {
                         coerced = coercer.apply(read.apply(first));
                     } catch (IllegalArgumentException | DateTimeException e) {
-                        onFailure(columnName, from, to, e, warnings);
+                        onCoercionFailure(columnName, from, to, e, warnings);
                         builder.appendNull();
                         continue;
                     }
@@ -244,7 +259,7 @@ public final class DeclaredTypeCoercions {
                         try {
                             scratch[v] = coercer.apply(read.apply(first + v));
                         } catch (IllegalArgumentException | DateTimeException e) {
-                            onFailure(columnName, from, to, e, warnings);
+                            onCoercionFailure(columnName, from, to, e, warnings);
                             failed = true;
                         }
                     }
@@ -263,7 +278,15 @@ public final class DeclaredTypeCoercions {
         }
     }
 
-    private static void onFailure(
+    /**
+     * The one coercion-failure chokepoint, shared by {@link #castBlock} and the readers' fused
+     * decode arms so a failed value behaves identically whichever path decoded it: with a
+     * {@code null} {@code warnings} sink (strict, {@code error_mode: fail_fast}) the failure
+     * propagates and the read fails; with a live sink the caller nulls the cell/position and one
+     * capped response {@code Warning} header records the reason. Callers append the null
+     * themselves — this method only decides throw-vs-warn.
+     */
+    public static void onCoercionFailure(
         @Nullable String columnName,
         DataType from,
         DataType to,

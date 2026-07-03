@@ -26,7 +26,7 @@ import java.util.TreeSet;
  * <p>What is checked here:
  * <ul>
  *   <li>every declared {@code type} resolves to a type the external readers can actually produce
- *       (the {@link #DECLARABLE_TYPES} whitelist — declaring {@code ip}/{@code geo_point}/etc. is rejected
+ *       (the {@link #DECLARABLE_TYPES} whitelist — declaring {@code geo_point}/{@code version}/etc. is rejected
  *       until the readers grow them);</li>
  *   <li>under strict mode ({@code dynamic: false}) the {@code _id.path} column must be declared —
  *       nothing is inferred to satisfy it.</li>
@@ -41,7 +41,12 @@ public final class DeclaredSchemaValidator {
 
     private DeclaredSchemaValidator() {}
 
-    /** ES|QL types the external readers (CSV/NDJSON/Parquet/ORC) can currently produce, hence the declarable set. */
+    /**
+     * ES|QL types the external readers (CSV/NDJSON/Parquet/ORC) can currently produce, hence the declarable set.
+     * {@code ip} is produced by parsing a string column (the mapper-style coercion in
+     * {@code DeclaredTypeCoercions}: CSV parses it directly, Parquet/ORC coerce a physical string column);
+     * per-format narrowing stays deferred to read time like the rest of the set (see the class Javadoc).
+     */
     static final Set<DataType> DECLARABLE_TYPES = Set.of(
         DataType.KEYWORD,
         DataType.TEXT,
@@ -50,7 +55,8 @@ public final class DeclaredSchemaValidator {
         DataType.DOUBLE,
         DataType.BOOLEAN,
         DataType.DATETIME,
-        DataType.UNSIGNED_LONG
+        DataType.UNSIGNED_LONG,
+        DataType.IP
     );
 
     public static void validate(DatasetMapping mapping) {

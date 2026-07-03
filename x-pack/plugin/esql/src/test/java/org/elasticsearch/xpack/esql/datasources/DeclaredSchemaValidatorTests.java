@@ -121,7 +121,7 @@ public class DeclaredSchemaValidatorTests extends ESTestCase {
         DeclaredSchemaValidator.validate(
             mapping(
                 Dynamic.TRUE,
-                props("a", "keyword", "b", "long", "c", "integer", "d", "double", "e", "boolean", "f", "date", "g", "unsigned_long"),
+                props("a", "keyword", "b", "long", "c", "integer", "d", "double", "e", "boolean", "f", "date", "g", "unsigned_long", "h", "ip"),
                 null
             )
         );
@@ -133,7 +133,7 @@ public class DeclaredSchemaValidatorTests extends ESTestCase {
     }
 
     public void testUnsupportedTypeRejected() {
-        for (String bad : new String[] { "ip", "geo_point", "date_nanos", "binary", "short", "float", "not_a_type" }) {
+        for (String bad : new String[] { "geo_point", "date_nanos", "binary", "short", "float", "version", "not_a_type" }) {
             IllegalArgumentException e = expectThrows(
                 IllegalArgumentException.class,
                 () -> DeclaredSchemaValidator.validate(mapping(Dynamic.TRUE, props("col", bad), null))

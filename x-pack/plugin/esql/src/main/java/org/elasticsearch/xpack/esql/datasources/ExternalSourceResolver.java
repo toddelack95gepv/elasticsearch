@@ -711,10 +711,11 @@ public class ExternalSourceResolver {
     /**
      * For a file-typed format, every declared column's type must either equal the reconciled (inferred) type of the
      * physical column it reads, or be a type the reader can coerce it into at decode time
-     * ({@link DeclaredTypeCoercions#supports} — e.g. an {@code int64} column declared {@code datetime}, a string
-     * column declared {@code datetime} parsed with the column's declared {@code format}). Anything else would surface
-     * as an internal block type mismatch deep in the engine or as silent nulls; reject it here, at resolution, with an
-     * actionable message instead.
+     * ({@link DeclaredTypeCoercions#supports} — the field mappers' bulk-ingest coercion set: e.g. a {@code long}
+     * column declared {@code double}, a string column declared {@code long}/{@code ip}, a string column declared
+     * {@code datetime} parsed with the column's declared {@code format}). The rare pair even ingest cannot coerce
+     * (e.g. a timestamp column declared {@code ip}) would surface as an internal block type mismatch deep in the
+     * engine or as silent nulls; reject it here, at resolution, with an actionable message instead.
      * <p>
      * The same walk polices a declared date {@code format}: on a file-typed format it only ever takes effect as the
      * string&rarr;date parse pattern, so a format on a column whose physical type is not a string could never apply

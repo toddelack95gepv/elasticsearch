@@ -7,28 +7,49 @@
 
 package org.elasticsearch.xpack.esql.datasources.spi;
 
+import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.common.time.DateFormatter;
+import org.elasticsearch.compute.data.Block;
+import org.elasticsearch.compute.data.BlockFactory;
+import org.elasticsearch.compute.data.BooleanBlock;
+import org.elasticsearch.compute.data.BytesRefBlock;
+import org.elasticsearch.compute.data.DoubleBlock;
+import org.elasticsearch.compute.data.LongBlock;
+import org.elasticsearch.compute.test.TestBlockFactory;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.xpack.esql.core.type.DataType;
+import org.elasticsearch.xpack.esql.core.util.NumericUtils;
+import org.elasticsearch.xpack.esql.core.util.StringUtils;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Set;
 
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.hasSize;
 
 /**
- * Pins the declared-type coercion matrix ({@link DeclaredTypeCoercions#supports}) and the shared
- * string&rarr;datetime conversion ({@link DeclaredTypeCoercions#parseDatetimeMillis}). The matrix is the single source
- * of truth every external reader and the resolver consult, so any drift — a new supported pair a reader doesn't
- * implement, or a dropped pair — must fail here rather than surface as a silent-null or a deep engine error.
+ * Pins the declared-type coercion contract: the castability predicate
+ * ({@link DeclaredTypeCoercions#supports} — the field mappers' bulk-ingest coercion set), the
+ * fused-decode subset ({@link DeclaredTypeCoercions#fusedInDecode}), the block-level coercion
+ * engine ({@link DeclaredTypeCoercions#castBlock} — value semantics, per-cell bulk leniency,
+ * multi-value handling), and the shared string&rarr;datetime scalar
+ * ({@link DeclaredTypeCoercions#parseDatetimeMillis}). This class is the single source of truth
+ * every external reader and the resolver consult, so any drift — a pair the resolver admits that
+ * the engine cannot coerce, or vice versa — must fail here rather than surface as a silent-null
+ * or a deep engine error.
  */
 public class DeclaredTypeCoercionsTests extends ESTestCase {
 
+    private final BlockFactory blockFactory = TestBlockFactory.getNonBreakingInstance();
+
     /**
-     * Exactly the documented supported pairs return true and everything else false. A curated type set (the declarable
-     * types plus a few non-declarable ones as negative controls) is walked exhaustively; encode the expectation
-     * independently of the implementation so a change to either side is caught.
+     * The full (physical, declared) matrix over the types the file mappers produce plus the
+     * declarable set, checked against an independently-written expectation of the mapper-ingest
+     * coercion rules (so a change to either side is caught).
      */
-    public void testSupportedMatrixPinned() {
+    public void testSupportsPinnedToMapperCoercionSet() {
         Set<DataType> types = Set.of(
             DataType.KEYWORD,
             DataType.TEXT,
@@ -39,47 +60,254 @@ public class DeclaredTypeCoercionsTests extends ESTestCase {
             DataType.DATETIME,
             DataType.DATE_NANOS,
             DataType.IP,
-            DataType.UNSIGNED_LONG
+            DataType.UNSIGNED_LONG,
+            DataType.UNSUPPORTED,
+            DataType.NULL
         );
         for (DataType from : types) {
             for (DataType to : types) {
-                boolean expected = expectedSupported(from, to);
                 assertThat(
                     "supports(" + from.typeName() + ", " + to.typeName() + ")",
                     DeclaredTypeCoercions.supports(from, to),
-                    equalTo(expected)
+                    equalTo(expectedSupported(from, to))
                 );
             }
         }
     }
 
-    /** The expected matrix, written out longhand so it is not a copy of the implementation. */
+    /** The expected mapper-ingest coercion set, written out longhand so it is not a copy of the implementation. */
     private static boolean expectedSupported(DataType from, DataType to) {
         if (from == to) {
             return true; // identity is always a no-op coercion
         }
-        if (from == DataType.INTEGER && to == DataType.LONG) {
-            return true; // lossless widen
-        }
-        if (from == DataType.LONG && to == DataType.DATETIME) {
-            return true; // reinterpret epoch millis
+        if (from == DataType.UNSUPPORTED || from == DataType.NULL || to == DataType.UNSUPPORTED || to == DataType.NULL) {
+            return false; // nothing to decode, hence nothing to coerce
         }
         boolean fromString = from == DataType.KEYWORD || from == DataType.TEXT;
-        if (fromString && (to == DataType.KEYWORD || to == DataType.TEXT)) {
-            return true; // string flavor relabel
-        }
-        return fromString && to == DataType.DATETIME; // parse
+        // decoded temporals are epoch longs, so they behave like whole numbers toward numeric targets
+        boolean fromWhole = from == DataType.INTEGER
+            || from == DataType.LONG
+            || from == DataType.UNSIGNED_LONG
+            || from == DataType.DATETIME
+            || from == DataType.DATE_NANOS;
+        return switch (to) {
+            case KEYWORD, TEXT -> true; // ingest stringifies any scalar
+            case LONG, INTEGER, DOUBLE, UNSIGNED_LONG -> fromString || fromWhole || from == DataType.DOUBLE;
+            case BOOLEAN -> fromString; // number->boolean does not ingest
+            case DATETIME -> fromString || from == DataType.INTEGER || from == DataType.LONG || from == DataType.UNSIGNED_LONG;
+            case DATE_NANOS -> fromString; // a millis payload is not nanos
+            case IP -> fromString;
+            default -> false;
+        };
     }
 
-    /** A few excluded pairs called out explicitly, so the reason each is unsupported is documented as a test. */
-    public void testDeliberateExclusions() {
-        assertFalse("narrowing long->integer is lossy", DeclaredTypeCoercions.supports(DataType.LONG, DataType.INTEGER));
-        assertFalse("long->double is lossy", DeclaredTypeCoercions.supports(DataType.LONG, DataType.DOUBLE));
-        assertFalse("integer has no 32-bit epoch encoding", DeclaredTypeCoercions.supports(DataType.INTEGER, DataType.DATETIME));
-        assertFalse("unsigned_long is sign-flip encoded", DeclaredTypeCoercions.supports(DataType.UNSIGNED_LONG, DataType.DATETIME));
-        assertFalse("date_nanos is not a declarable type yet", DeclaredTypeCoercions.supports(DataType.LONG, DataType.DATE_NANOS));
-        assertFalse("no datetime->long reverse", DeclaredTypeCoercions.supports(DataType.DATETIME, DataType.LONG));
+    /** The pairs this change opened up, called out explicitly so the contract reads as a test. */
+    public void testWidenedPairsSupported() {
+        assertTrue("long->double coerces like bulk ingest", DeclaredTypeCoercions.supports(DataType.LONG, DataType.DOUBLE));
+        assertTrue("integer->double coerces like bulk ingest", DeclaredTypeCoercions.supports(DataType.INTEGER, DataType.DOUBLE));
+        assertTrue("string->long parses", DeclaredTypeCoercions.supports(DataType.KEYWORD, DataType.LONG));
+        assertTrue("string->double parses", DeclaredTypeCoercions.supports(DataType.KEYWORD, DataType.DOUBLE));
+        assertTrue("string->integer parses", DeclaredTypeCoercions.supports(DataType.KEYWORD, DataType.INTEGER));
+        assertTrue("string->boolean parses", DeclaredTypeCoercions.supports(DataType.KEYWORD, DataType.BOOLEAN));
+        assertTrue("string->ip parses", DeclaredTypeCoercions.supports(DataType.KEYWORD, DataType.IP));
+        assertTrue("long->integer narrows with range check", DeclaredTypeCoercions.supports(DataType.LONG, DataType.INTEGER));
+        assertTrue("datetime->long reads epoch millis", DeclaredTypeCoercions.supports(DataType.DATETIME, DataType.LONG));
     }
+
+    /** Pairs even ingest cannot coerce — the resolver's reject path stays reachable through these. */
+    public void testInconvertiblePairsRejected() {
+        assertFalse("timestamp->ip has no ingest coercion", DeclaredTypeCoercions.supports(DataType.DATETIME, DataType.IP));
+        assertFalse("long->ip has no ingest coercion", DeclaredTypeCoercions.supports(DataType.LONG, DataType.IP));
+        assertFalse("number->boolean does not ingest", DeclaredTypeCoercions.supports(DataType.LONG, DataType.BOOLEAN));
+        assertFalse("double->datetime has no epoch encoding", DeclaredTypeCoercions.supports(DataType.DOUBLE, DataType.DATETIME));
+        assertFalse("unsupported physical columns cannot decode", DeclaredTypeCoercions.supports(DataType.UNSUPPORTED, DataType.KEYWORD));
+    }
+
+    /** The fused pairs are exactly the historical natively-decoded set, and every fused pair is supported. */
+    public void testFusedPairsAreSupportedSubset() {
+        Set<DataType> types = Set.of(
+            DataType.KEYWORD,
+            DataType.TEXT,
+            DataType.INTEGER,
+            DataType.LONG,
+            DataType.DOUBLE,
+            DataType.BOOLEAN,
+            DataType.DATETIME,
+            DataType.IP,
+            DataType.UNSIGNED_LONG
+        );
+        for (DataType from : types) {
+            for (DataType to : types) {
+                if (DeclaredTypeCoercions.fusedInDecode(from, to)) {
+                    assertTrue(
+                        "fused pair must be supported: " + from.typeName() + "->" + to.typeName(),
+                        DeclaredTypeCoercions.supports(from, to)
+                    );
+                }
+            }
+        }
+        assertTrue(DeclaredTypeCoercions.fusedInDecode(DataType.INTEGER, DataType.LONG));
+        assertTrue(DeclaredTypeCoercions.fusedInDecode(DataType.LONG, DataType.DATETIME));
+        assertTrue(DeclaredTypeCoercions.fusedInDecode(DataType.KEYWORD, DataType.DATETIME));
+        assertTrue(DeclaredTypeCoercions.fusedInDecode(DataType.KEYWORD, DataType.TEXT));
+        assertFalse("long->double runs through castBlock", DeclaredTypeCoercions.fusedInDecode(DataType.LONG, DataType.DOUBLE));
+        assertFalse("string->long runs through castBlock", DeclaredTypeCoercions.fusedInDecode(DataType.KEYWORD, DataType.LONG));
+    }
+
+    // ---- castBlock value semantics ----
+
+    public void testCastLongToDouble() {
+        try (Block source = blockFactory.newLongArrayVector(new long[] { 1L, -42L, 9007199254740993L }, 3).asBlock()) {
+            try (Block cast = castStrict(source, DataType.LONG, DataType.DOUBLE)) {
+                DoubleBlock doubles = (DoubleBlock) cast;
+                assertThat(doubles.getDouble(0), equalTo(1.0));
+                assertThat(doubles.getDouble(1), equalTo(-42.0));
+                // bulk ingest of a long beyond 2^53 into a double loses precision the same way
+                assertThat(doubles.getDouble(2), equalTo(9007199254740992.0));
+            }
+        }
+    }
+
+    public void testCastStringToLongDoubleBooleanIp() {
+        try (Block src = bytesBlock("42"); Block longs = castStrict(src, DataType.KEYWORD, DataType.LONG)) {
+            assertThat(((LongBlock) longs).getLong(0), equalTo(42L));
+        }
+        try (Block src = bytesBlock("1e2"); Block doubles = castStrict(src, DataType.KEYWORD, DataType.DOUBLE)) {
+            assertThat(((DoubleBlock) doubles).getDouble(0), equalTo(100.0));
+        }
+        try (Block src = bytesBlock("true"); Block booleans = castStrict(src, DataType.KEYWORD, DataType.BOOLEAN)) {
+            assertTrue(((BooleanBlock) booleans).getBoolean(0));
+        }
+        try (Block src = bytesBlock("10.20.30.40"); Block ips = castStrict(src, DataType.KEYWORD, DataType.IP)) {
+            BytesRef ip = ((BytesRefBlock) ips).getBytesRef(0, new BytesRef());
+            assertThat(ip, equalTo(StringUtils.parseIP("10.20.30.40")));
+        }
+    }
+
+    public void testCastStringToUnsignedLongSignFlipEncodes() {
+        try (Block source = bytesBlock("18446744073709551615")) { // 2^64 - 1
+            try (Block cast = castStrict(source, DataType.KEYWORD, DataType.UNSIGNED_LONG)) {
+                long encoded = ((LongBlock) cast).getLong(0);
+                assertThat(NumericUtils.unsignedLongAsNumber(encoded).toString(), equalTo("18446744073709551615"));
+            }
+        }
+    }
+
+    public void testCastNumberToKeywordStringifiesToken() {
+        try (Block source = blockFactory.newLongArrayVector(new long[] { 42L }, 1).asBlock()) {
+            try (Block cast = castStrict(source, DataType.LONG, DataType.KEYWORD)) {
+                assertThat(((BytesRefBlock) cast).getBytesRef(0, new BytesRef()).utf8ToString(), equalTo("42"));
+            }
+        }
+    }
+
+    public void testCastDatetimeToKeywordIsIso() {
+        try (Block source = blockFactory.newLongArrayVector(new long[] { 971211336000L }, 1).asBlock()) {
+            try (Block cast = castStrict(source, DataType.DATETIME, DataType.KEYWORD)) {
+                assertThat(((BytesRefBlock) cast).getBytesRef(0, new BytesRef()).utf8ToString(), equalTo("2000-10-10T20:55:36.000Z"));
+            }
+        }
+    }
+
+    public void testCastStringToDatetimeHonorsDeclaredFormat() {
+        DateFormatter fmt = DateFormatter.forPattern("dd/MMM/yyyy:HH:mm:ss Z");
+        try (Block source = bytesBlock("10/Oct/2000:13:55:36 -0700")) {
+            try (
+                Block cast = DeclaredTypeCoercions.castBlock(source, DataType.KEYWORD, DataType.DATETIME, fmt, blockFactory, null, null)
+            ) {
+                assertThat(((LongBlock) cast).getLong(0), equalTo(971211336000L));
+            }
+        }
+    }
+
+    // ---- per-cell bulk leniency ----
+
+    public void testLenientCoercionNullsCellAndWarns() {
+        List<String> warnings = new ArrayList<>();
+        SkipWarnings sink = capturing(warnings);
+        try (Block source = bytesBlock("41", "not-a-number", "43")) {
+            try (
+                Block cast = DeclaredTypeCoercions.castBlock(source, DataType.KEYWORD, DataType.LONG, null, blockFactory, "col", sink)
+            ) {
+                LongBlock longs = (LongBlock) cast;
+                assertThat(longs.getLong(longs.getFirstValueIndex(0)), equalTo(41L));
+                assertTrue("the bad cell is null, not a wrong value and not a failure", longs.isNull(1));
+                assertThat(longs.getLong(longs.getFirstValueIndex(2)), equalTo(43L));
+            }
+        }
+        assertThat(warnings, hasSize(1));
+        assertThat(warnings.get(0), containsString("col"));
+        assertThat(warnings.get(0), containsString("declared type [long]"));
+        assertThat(warnings.get(0), containsString("returning null"));
+    }
+
+    public void testLenientOverflowNullsCellAndWarns() {
+        List<String> warnings = new ArrayList<>();
+        SkipWarnings sink = capturing(warnings);
+        try (Block source = blockFactory.newLongArrayVector(new long[] { 7L, Long.MAX_VALUE }, 2).asBlock()) {
+            try (
+                Block cast = DeclaredTypeCoercions.castBlock(source, DataType.LONG, DataType.INTEGER, null, blockFactory, "col", sink)
+            ) {
+                assertThat(((org.elasticsearch.compute.data.IntBlock) cast).getInt(0), equalTo(7));
+                assertTrue("out-of-range narrows to null, never truncates silently", cast.isNull(1));
+            }
+        }
+        assertThat(warnings, hasSize(1));
+        assertThat(warnings.get(0), containsString("out of range"));
+    }
+
+    public void testStrictCoercionThrows() {
+        try (Block source = bytesBlock("not-a-number")) {
+            expectThrows(
+                IllegalArgumentException.class,
+                () -> DeclaredTypeCoercions.castBlock(source, DataType.KEYWORD, DataType.LONG, null, blockFactory, null, null).close()
+            );
+        }
+    }
+
+    public void testMultiValuePositionNullsWholePositionOnFailure() {
+        List<String> warnings = new ArrayList<>();
+        SkipWarnings sink = capturing(warnings);
+        try (BytesRefBlock.Builder builder = blockFactory.newBytesRefBlockBuilder(2)) {
+            builder.beginPositionEntry();
+            builder.appendBytesRef(new BytesRef("1"));
+            builder.appendBytesRef(new BytesRef("oops"));
+            builder.endPositionEntry();
+            builder.beginPositionEntry();
+            builder.appendBytesRef(new BytesRef("2"));
+            builder.appendBytesRef(new BytesRef("3"));
+            builder.endPositionEntry();
+            try (Block source = builder.build()) {
+                try (
+                    Block cast = DeclaredTypeCoercions.castBlock(source, DataType.KEYWORD, DataType.LONG, null, blockFactory, "col", sink)
+                ) {
+                    assertTrue("bulk semantics null the whole field, not one element", cast.isNull(0));
+                    LongBlock longs = (LongBlock) cast;
+                    assertThat(longs.getValueCount(1), equalTo(2));
+                    int first = longs.getFirstValueIndex(1);
+                    assertThat(longs.getLong(first), equalTo(2L));
+                    assertThat(longs.getLong(first + 1), equalTo(3L));
+                }
+            }
+        }
+        assertThat(warnings, hasSize(1));
+    }
+
+    public void testNullsAndIdentityPreserved() {
+        try (Block source = blockFactory.newConstantNullBlock(3)) {
+            try (Block cast = castStrict(source, DataType.LONG, DataType.DOUBLE)) {
+                assertTrue(cast.areAllValuesNull());
+                assertThat(cast.getPositionCount(), equalTo(3));
+            }
+        }
+        try (Block source = blockFactory.newLongArrayVector(new long[] { 5L }, 1).asBlock()) {
+            try (Block same = castStrict(source, DataType.LONG, DataType.LONG)) {
+                assertThat(((LongBlock) same).getLong(0), equalTo(5L));
+            }
+        }
+    }
+
+    // ---- parseDatetimeMillis (shared string->datetime scalar) ----
 
     public void testParseDatetimeMillisDeclaredFormatZoneAware() {
         // Same token + format the CSV/NDJSON reader tests pin: the -0700 offset is honored, landing at 20:55:36Z.
@@ -94,5 +322,29 @@ public class DeclaredTypeCoercionsTests extends ESTestCase {
 
     public void testParseDatetimeMillisThrowsOnGarbage() {
         expectThrows(IllegalArgumentException.class, () -> DeclaredTypeCoercions.parseDatetimeMillis("not-a-date", null));
+    }
+
+    // ---- helpers ----
+
+    private Block castStrict(Block source, DataType from, DataType to) {
+        return DeclaredTypeCoercions.castBlock(source, from, to, null, blockFactory, null, null);
+    }
+
+    private Block bytesBlock(String... values) {
+        try (BytesRefBlock.Builder builder = blockFactory.newBytesRefBlockBuilder(values.length)) {
+            for (String v : values) {
+                builder.appendBytesRef(new BytesRef(v));
+            }
+            return builder.build();
+        }
+    }
+
+    private static SkipWarnings capturing(List<String> into) {
+        return new SkipWarnings("summary") {
+            @Override
+            public void add(String detail) {
+                into.add(detail);
+            }
+        };
     }
 }

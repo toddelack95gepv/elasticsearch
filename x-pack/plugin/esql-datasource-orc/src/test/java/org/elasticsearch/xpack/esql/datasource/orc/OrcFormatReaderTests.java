@@ -28,6 +28,7 @@ import org.apache.orc.OrcFile;
 import org.apache.orc.TypeDescription;
 import org.apache.orc.Writer;
 import org.elasticsearch.common.breaker.NoopCircuitBreaker;
+import org.elasticsearch.common.time.DateFormatter;
 import org.elasticsearch.common.util.BigArrays;
 import org.elasticsearch.compute.data.BlockFactory;
 import org.elasticsearch.compute.data.BooleanBlock;
@@ -42,8 +43,12 @@ import org.elasticsearch.core.SuppressForbidden;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.Nullability;
+import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
+import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.datasources.spi.ColumnExtractor;
+import org.elasticsearch.xpack.esql.datasources.spi.DeclaredTypeCoercions;
+import org.elasticsearch.xpack.esql.datasources.spi.ErrorPolicy;
 import org.elasticsearch.xpack.esql.datasources.spi.FormatReader;
 import org.elasticsearch.xpack.esql.datasources.spi.RangeAwareFormatReader.SplitRange;
 import org.elasticsearch.xpack.esql.datasources.spi.RangeReadContext;
@@ -61,6 +66,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 
 public class OrcFormatReaderTests extends ESTestCase {
 
@@ -1434,6 +1440,94 @@ public class OrcFormatReaderTests extends ESTestCase {
     @FunctionalInterface
     private interface BatchPopulator {
         void populate(VectorizedRowBatch batch);
+    }
+
+    // ===== Declared-type coercion (Hive/Trino-style read-time coercion, unified across formats) =====
+
+    public void testStringToDatetimeCoercesViaSharedScalar() throws Exception {
+        // A declared `date` on a STRING ORC column is coerced string->datetime at read time through the SAME
+        // DeclaredTypeCoercions.parseDatetimeMillis the text and parquet readers use — assert the decoded value equals
+        // that shared scalar directly, proving the coercion is one registry across all formats (not a parallel impl),
+        // and equals the ACCESS_LOG epoch the CSV/NDJSON/Parquet tests pin (cross-format equivalence).
+        TypeDescription schema = TypeDescription.createStruct().addField("ts", TypeDescription.createString());
+        byte[] orcData = createOrcFile(schema, batch -> {
+            batch.size = 1;
+            ((BytesColumnVector) batch.cols[0]).setVal(0, "10/Oct/2000:13:55:36 -0700".getBytes(StandardCharsets.UTF_8));
+        });
+        StorageObject storageObject = createStorageObject(orcData);
+        OrcFormatReader reader = (OrcFormatReader) new OrcFormatReader(blockFactory).withDeclaredDateFormats(
+            Map.of("ts", "dd/MMM/yyyy:HH:mm:ss Z")
+        );
+        List<Attribute> plannerSchema = List.of(new ReferenceAttribute(Source.EMPTY, "ts", DataType.DATETIME));
+        try (
+            CloseableIterator<Page> it = reader.readRange(
+                storageObject,
+                new RangeReadContext(List.of("ts"), 10, 0, orcData.length, plannerSchema, ErrorPolicy.STRICT)
+            )
+        ) {
+            Page page = it.next();
+            assertEquals(1, page.getPositionCount());
+            long shared = DeclaredTypeCoercions.parseDatetimeMillis(
+                "10/Oct/2000:13:55:36 -0700",
+                DateFormatter.forPattern("dd/MMM/yyyy:HH:mm:ss Z")
+            );
+            assertEquals(shared, ((LongBlock) page.getBlock(0)).getLong(0));
+            assertEquals(971211336000L, ((LongBlock) page.getBlock(0)).getLong(0));
+            page.releaseBlocks();
+        }
+    }
+
+    public void testLongToDatetimeReinterpretNotDayScaled() throws Exception {
+        // A declared `datetime` on a BIGINT (int64) column reinterprets the raw epoch MILLIS (x1) — it must NOT be
+        // day-scaled like a native ORC DATE (days x 86_400_000). Value 1 => epoch milli 1, not 86_400_000.
+        TypeDescription schema = TypeDescription.createStruct().addField("id", TypeDescription.createLong());
+        byte[] orcData = createOrcFile(schema, batch -> {
+            batch.size = 2;
+            LongColumnVector idCol = (LongColumnVector) batch.cols[0];
+            idCol.vector[0] = 1L;
+            idCol.vector[1] = 2L;
+        });
+        StorageObject storageObject = createStorageObject(orcData);
+        OrcFormatReader reader = new OrcFormatReader(blockFactory);
+        List<Attribute> plannerSchema = List.of(new ReferenceAttribute(Source.EMPTY, "id", DataType.DATETIME));
+        try (
+            CloseableIterator<Page> it = reader.readRange(
+                storageObject,
+                new RangeReadContext(List.of("id"), 10, 0, orcData.length, plannerSchema, ErrorPolicy.STRICT)
+            )
+        ) {
+            Page page = it.next();
+            assertEquals(2, page.getPositionCount());
+            assertEquals(1L, ((LongBlock) page.getBlock(0)).getLong(0));
+            assertEquals(2L, ((LongBlock) page.getBlock(0)).getLong(1));
+            page.releaseBlocks();
+        }
+    }
+
+    public void testInt32ToLongCoerces() throws Exception {
+        // A declared `long` on an INT32 ORC column widens losslessly at read time.
+        TypeDescription schema = TypeDescription.createStruct().addField("n", TypeDescription.createInt());
+        byte[] orcData = createOrcFile(schema, batch -> {
+            batch.size = 2;
+            LongColumnVector nCol = (LongColumnVector) batch.cols[0];
+            nCol.vector[0] = 7L;
+            nCol.vector[1] = 42L;
+        });
+        StorageObject storageObject = createStorageObject(orcData);
+        OrcFormatReader reader = new OrcFormatReader(blockFactory);
+        List<Attribute> plannerSchema = List.of(new ReferenceAttribute(Source.EMPTY, "n", DataType.LONG));
+        try (
+            CloseableIterator<Page> it = reader.readRange(
+                storageObject,
+                new RangeReadContext(List.of("n"), 10, 0, orcData.length, plannerSchema, ErrorPolicy.STRICT)
+            )
+        ) {
+            Page page = it.next();
+            assertEquals(2, page.getPositionCount());
+            assertEquals(7L, ((LongBlock) page.getBlock(0)).getLong(0));
+            assertEquals(42L, ((LongBlock) page.getBlock(0)).getLong(1));
+            page.releaseBlocks();
+        }
     }
 
     private byte[] createOrcFile(TypeDescription schema, BatchPopulator populator) throws IOException {

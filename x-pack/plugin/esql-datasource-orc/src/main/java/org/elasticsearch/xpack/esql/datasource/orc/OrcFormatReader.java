@@ -758,18 +758,6 @@ public class OrcFormatReader implements RangeAwareFormatReader, NoConfigFormatRe
         return "orc";
     }
 
-    /**
-     * ORC's only per-value errors are declared-type coercion failures (a structural error —
-     * corrupt stripe, bad tail — always fails the read regardless of policy). The default
-     * matches the text readers' {@code null_field} semantics for the same declared coercion:
-     * null the cell + response {@code Warning}. {@code error_mode: fail_fast} opts into failing
-     * the read on the first uncoercible value, exactly like a text-format parse failure.
-     */
-    @Override
-    public ErrorPolicy defaultErrorPolicy() {
-        return ErrorPolicy.PERMISSIVE;
-    }
-
     /** Mirrors the Parquet reader: a {@code null} context policy falls back to {@link #defaultErrorPolicy()}. */
     private ErrorPolicy resolveErrorPolicy(@Nullable ErrorPolicy contextPolicy) {
         return contextPolicy != null ? contextPolicy : defaultErrorPolicy();

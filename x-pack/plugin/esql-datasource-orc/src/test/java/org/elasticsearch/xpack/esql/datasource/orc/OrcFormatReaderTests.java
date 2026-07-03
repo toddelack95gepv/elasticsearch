@@ -1609,10 +1609,18 @@ public class OrcFormatReaderTests extends ESTestCase {
         }
     }
 
+    public void testDefaultErrorPolicyIsStrict() {
+        // Guard the columnar default: it must be STRICT (fail_fast) — the base FormatReader default, identical to the
+        // text readers (CSV/NDJSON) and Parquet. A per-value coercion failure fails the read unless a query opts into
+        // error_mode: null_field. This pins the cross-format consistency and fails if a permissive default is ever
+        // re-introduced for this reader.
+        assertEquals(ErrorPolicy.STRICT, new OrcFormatReader(blockFactory).defaultErrorPolicy());
+    }
+
     public void testCoercionUnparseableValueEmitsWarningAndNull() throws Exception {
-        // Per-cell leniency under the DEFAULT error policy (null context policy -> the reader's
-        // PERMISSIVE null_field default): a token the declared type cannot coerce nulls THAT cell
-        // and records a response Warning header; the surrounding cells still decode.
+        // Per-cell leniency under an explicit null_field (PERMISSIVE) error policy: a token the declared type
+        // cannot coerce nulls THAT cell and records a response Warning header; the surrounding cells still decode.
+        // (The default policy is STRICT — see testDefaultErrorPolicyIsStrict — so leniency is opt-in.)
         TypeDescription schema = TypeDescription.createStruct().addField("n", TypeDescription.createString());
         byte[] orcData = createOrcFile(schema, batch -> {
             batch.size = 3;
@@ -1626,7 +1634,7 @@ public class OrcFormatReaderTests extends ESTestCase {
         try (
             CloseableIterator<Page> it = reader.readRange(
                 storageObject,
-                new RangeReadContext(List.of("n"), 10, 0, orcData.length, plannerSchema, null)
+                new RangeReadContext(List.of("n"), 10, 0, orcData.length, plannerSchema, ErrorPolicy.PERMISSIVE)
             )
         ) {
             Page page = it.next();
@@ -1672,10 +1680,10 @@ public class OrcFormatReaderTests extends ESTestCase {
         assertTrue("fail_fast must not emit coercion warnings", drainWarnings().isEmpty());
     }
 
-    public void testStringToDatetimeBadTokenWarnsAndNullsByDefaultFailsUnderFailFast() throws Exception {
-        // The FUSED string->datetime arm follows the same per-cell leniency as castBlock under the
-        // default policy (bad token -> null cell + Warning, read succeeds) and aborts under
-        // fail_fast — it previously hard-failed the read on any policy.
+    public void testStringToDatetimeBadTokenNullFieldWarnsFailFastFails() throws Exception {
+        // The FUSED string->datetime arm follows the same per-cell leniency as castBlock: under an explicit
+        // null_field policy a bad token -> null cell + Warning and the read succeeds; under fail_fast (also the
+        // default) it aborts — it previously hard-failed the read on any policy.
         TypeDescription schema = TypeDescription.createStruct().addField("ts", TypeDescription.createString());
         byte[] orcData = createOrcFile(schema, batch -> {
             batch.size = 3;
@@ -1688,7 +1696,7 @@ public class OrcFormatReaderTests extends ESTestCase {
         try (
             CloseableIterator<Page> it = reader.readRange(
                 createStorageObject(orcData),
-                new RangeReadContext(List.of("ts"), 10, 0, orcData.length, plannerSchema, null)
+                new RangeReadContext(List.of("ts"), 10, 0, orcData.length, plannerSchema, ErrorPolicy.PERMISSIVE)
             )
         ) {
             Page page = it.next();
@@ -1744,7 +1752,7 @@ public class OrcFormatReaderTests extends ESTestCase {
         try (
             CloseableIterator<Page> it = reader.readRange(
                 createStorageObject(orcData),
-                new RangeReadContext(List.of("vals"), 10, 0, orcData.length, plannerSchema, null)
+                new RangeReadContext(List.of("vals"), 10, 0, orcData.length, plannerSchema, ErrorPolicy.PERMISSIVE)
             )
         ) {
             Page page = it.next();

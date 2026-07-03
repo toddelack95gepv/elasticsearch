@@ -1383,8 +1383,9 @@ public class FromDatasetIT extends AbstractExternalDataSourceIT {
         // nulls THAT cell and the query SUCCEEDS — for BOTH plan shapes over the same cell. The
         // eager KEEP decodes the coerced column in the forward scan; the wide-projection TopN
         // defers it to ParquetColumnExtractor. Pre-fix the eager read hard-failed while the
-        // deferred one warned+nulled — same cell, opposite outcome by plan shape.
-        putBadDateTokenDataset("logs_bad_date_token", Map.of());
+        // deferred one warned+nulled — same cell, opposite outcome by plan shape. error_mode is
+        // set explicitly: the default is fail_fast (columnar readers no longer default to permissive).
+        putBadDateTokenDataset("logs_bad_date_token", Map.of("error_mode", "null_field"));
 
         // Eager: one kept non-sort column stays under the deferred-extraction threshold.
         try (var response = run(syncEsqlQueryRequest("FROM logs_bad_date_token | SORT pri | KEEP ts | LIMIT 10"), TIMEOUT)) {

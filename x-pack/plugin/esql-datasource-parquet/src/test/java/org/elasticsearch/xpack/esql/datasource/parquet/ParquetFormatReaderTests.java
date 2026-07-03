@@ -2748,10 +2748,18 @@ public class ParquetFormatReaderTests extends ESTestCase {
         }
     }
 
+    public void testDefaultErrorPolicyIsStrict() {
+        // Guard the columnar default: it must be STRICT (fail_fast) — the base FormatReader default, identical to the
+        // text readers (CSV/NDJSON) and ORC. A per-value coercion failure fails the read unless a query opts into
+        // error_mode: null_field. This pins the cross-format consistency and fails if a permissive default is ever
+        // re-introduced for this reader.
+        assertEquals(ErrorPolicy.STRICT, new ParquetFormatReader(blockFactory).defaultErrorPolicy());
+    }
+
     public void testStringDeclaredLongUnparseableWarnsAndNulls() throws Exception {
-        // Per-cell leniency under the DEFAULT error policy (null context policy -> the reader's
-        // PERMISSIVE null_field default): an unparseable token nulls THAT cell and records a
-        // response Warning header; the parseable cell still decodes. Not a silent wrong value.
+        // Per-cell leniency under an explicit null_field (PERMISSIVE) error policy: an unparseable token nulls
+        // THAT cell and records a response Warning header; the parseable cell still decodes. Not a silent wrong
+        // value. (The default policy is STRICT — see testDefaultErrorPolicyIsStrict — so leniency is opt-in.)
         MessageType schema = Types.buildMessage()
             .required(PrimitiveType.PrimitiveTypeName.BINARY)
             .as(LogicalTypeAnnotation.stringType())
@@ -2770,7 +2778,7 @@ public class ParquetFormatReaderTests extends ESTestCase {
         try (
             CloseableIterator<Page> it = r.readRange(
                 storageObject,
-                new RangeReadContext(List.of("x"), 10, 0, parquetData.length, plannerTypes, null)
+                new RangeReadContext(List.of("x"), 10, 0, parquetData.length, plannerTypes, ErrorPolicy.PERMISSIVE)
             )
         ) {
             Page page = it.next();
@@ -2862,7 +2870,7 @@ public class ParquetFormatReaderTests extends ESTestCase {
         try (
             CloseableIterator<Page> it = r.readRange(
                 storageObject,
-                new RangeReadContext(List.of("x"), 10, 0, parquetData.length, plannerTypes, null)
+                new RangeReadContext(List.of("x"), 10, 0, parquetData.length, plannerTypes, ErrorPolicy.PERMISSIVE)
             )
         ) {
             Page page = it.next();
@@ -2910,7 +2918,7 @@ public class ParquetFormatReaderTests extends ESTestCase {
             try (
                 CloseableIterator<Page> it = r.readRange(
                     storageObject,
-                    new RangeReadContext(List.of("ts"), 10, 0, parquetData.length, plannerTypes, null)
+                    new RangeReadContext(List.of("ts"), 10, 0, parquetData.length, plannerTypes, ErrorPolicy.PERMISSIVE)
                 )
             ) {
                 Page page = it.next();
@@ -2978,7 +2986,7 @@ public class ParquetFormatReaderTests extends ESTestCase {
         try (
             CloseableIterator<Page> it = r.readRange(
                 storageObject,
-                new RangeReadContext(List.of("vals"), 10, 0, parquetData.length, plannerTypes, null)
+                new RangeReadContext(List.of("vals"), 10, 0, parquetData.length, plannerTypes, ErrorPolicy.PERMISSIVE)
             )
         ) {
             Page page = it.next();

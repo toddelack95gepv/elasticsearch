@@ -398,18 +398,6 @@ public class ParquetFormatReader implements RangeAwareFormatReader, ColumnExtrac
     }
 
     /**
-     * Parquet's only per-value errors are declared-type coercion failures (a structural error —
-     * corrupt page, bad footer — always fails the read regardless of policy). The default
-     * matches the text readers' {@code null_field} semantics for the same declared coercion:
-     * null the cell + response {@code Warning}. {@code error_mode: fail_fast} opts into failing
-     * the read on the first uncoercible value, exactly like a text-format parse failure.
-     */
-    @Override
-    public ErrorPolicy defaultErrorPolicy() {
-        return ErrorPolicy.PERMISSIVE;
-    }
-
-    /**
      * Coercion-failure leniency for one read: {@code fail_fast} is strict — a per-value coercion
      * failure must propagate, which the coercion sinks express as a {@code null}
      * {@link SkipWarnings}. Every other mode (including {@code skip_row}, which a columnar batch

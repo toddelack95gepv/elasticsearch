@@ -234,7 +234,8 @@ public class FromDatasetIT extends AbstractEsqlIntegTestCase {
         "logs_partition_collide_path",
         "employees_strict_coerce",
         "employees_strict_uncoercible",
-        "employees_strict_coerce_multi"
+        "employees_strict_coerce_multi",
+        "logs_parquet_string_date"
     );
 
     /**
@@ -1476,6 +1477,62 @@ public class FromDatasetIT extends AbstractEsqlIntegTestCase {
         Path tempFile = createTempDir().resolve("employees.parquet");
         Files.write(tempFile, parquetRenameFixtureBytes());
         return tempFile;
+    }
+
+    private Path writeParquetStringDateFixture() throws IOException {
+        // A Parquet BINARY(UTF8) column holding an access-log date string — the source of a columnar string->date coerce.
+        MessageType schema = MessageTypeParser.parseMessageType("message logs { required int64 id; required binary event_ts (UTF8); }");
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        SimpleGroupFactory factory = new SimpleGroupFactory(schema);
+        try (
+            ParquetWriter<Group> writer = ExampleParquetWriter.builder(createOutputFile(baos))
+                .withConf(new PlainParquetConfiguration())
+                .withType(schema)
+                .withCompressionCodec(CompressionCodecName.UNCOMPRESSED)
+                .build()
+        ) {
+            Group g = factory.newGroup();
+            g.add("id", 1L);
+            g.add("event_ts", "10/Oct/2000:13:55:36 -0700");
+            writer.write(g);
+        }
+        Path tempFile = createTempDir().resolve("logs.parquet");
+        Files.write(tempFile, baos.toByteArray());
+        return tempFile;
+    }
+
+    public void testStrictColumnarStringToDatetimeWithDeclaredFormatCoerces() throws Exception {
+        // The second driving case: a Parquet BINARY(UTF8) column of access-log date strings, declared `date` with a
+        // format, is coerced string->datetime at read time through the SAME DeclaredTypeCoercions.parseDatetimeMillis
+        // the text readers use — so the parsed instant equals the CSV/NDJSON tests' ACCESS_LOG_EPOCH_MILLIS exactly.
+        // Same token + same declared format => same instant across CSV, NDJSON, and Parquet: cross-format equivalence.
+        // ts::long recovers the raw epoch millis, proving the -0700 offset was honored (a zone-dropping parse is 7h off).
+        assertAcked(client().execute(PutDataSourceAction.INSTANCE, putDataSourceRequest("local_ds", Map.of())));
+        Path parquet = writeParquetStringDateFixture();
+        java.util.Map<String, DatasetFieldMapping> properties = new java.util.LinkedHashMap<>();
+        properties.put("id", new DatasetFieldMapping("long", null));
+        properties.put("ts", new DatasetFieldMapping("date", "event_ts", List.of(), ACCESS_LOG_FORMAT)); // string -> date
+        DatasetMapping mapping = new DatasetMapping(new DatasetMapping.Mappings(DatasetMapping.Dynamic.FALSE, properties));
+        assertAcked(
+            client().execute(
+                PutDatasetAction.INSTANCE,
+                new PutDatasetAction.Request(
+                    TIMEOUT,
+                    TIMEOUT,
+                    "logs_parquet_string_date",
+                    "local_ds",
+                    parquet.toUri().toString(),
+                    null,
+                    new HashMap<>(Map.of("format", "parquet")),
+                    mapping
+                )
+            )
+        );
+        try (var response = run(syncEsqlQueryRequest("FROM logs_parquet_string_date | EVAL ms = ts::long | KEEP ms | LIMIT 1"), TIMEOUT)) {
+            List<List<Object>> rows = getValuesList(response);
+            assertThat(rows, hasSize(1));
+            assertThat(rows.get(0).get(0), equalTo(ACCESS_LOG_EPOCH_MILLIS));
+        }
     }
 
     private byte[] parquetRenameFixtureBytes() throws IOException {

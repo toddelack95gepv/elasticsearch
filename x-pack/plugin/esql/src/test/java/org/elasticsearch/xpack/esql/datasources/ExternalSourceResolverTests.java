@@ -111,6 +111,19 @@ public class ExternalSourceResolverTests extends ESTestCase {
         assertFalse(ExternalSourceResolver.FILE_TYPED_FORMATS.contains("ndjson"));
     }
 
+    /**
+     * Pins {@link ExternalSourceResolver#COERCING_FILE_TYPED_FORMATS} — the columnar formats whose readers coerce a
+     * declared type from the file's physical type (vs strict equality). It must be a subset of the file-typed set, and
+     * {@code parquet-rs} must stay OUT of it (it is file-typed but does not implement coercion yet), so a declared
+     * retype on parquet-rs still requires strict equality rather than silently coercing.
+     */
+    public void testCoercingFileTypedFormatsPinned() {
+        assertEquals(Set.of(FormatNameResolver.FORMAT_PARQUET, "orc"), ExternalSourceResolver.COERCING_FILE_TYPED_FORMATS);
+        assertTrue(ExternalSourceResolver.FILE_TYPED_FORMATS.containsAll(ExternalSourceResolver.COERCING_FILE_TYPED_FORMATS));
+        assertTrue(ExternalSourceResolver.FILE_TYPED_FORMATS.contains(FormatNameResolver.FORMAT_PARQUET_RS));
+        assertFalse(ExternalSourceResolver.COERCING_FILE_TYPED_FORMATS.contains(FormatNameResolver.FORMAT_PARQUET_RS));
+    }
+
     // ===== FIRST_FILE_WINS tests (current behavior) =====
 
     /**

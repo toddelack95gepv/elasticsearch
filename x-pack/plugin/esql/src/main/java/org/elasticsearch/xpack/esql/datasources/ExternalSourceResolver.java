@@ -740,9 +740,7 @@ public class ExternalSourceResolver {
                 continue; // absence is handled by the overlay's own missing-column check
             }
             DataType declaredType = DataType.fromNameOrAlias(e.getValue().type());
-            boolean coercible = coercing
-                ? DeclaredTypeCoercions.supports(inferredType, declaredType)
-                : declaredType == inferredType;
+            boolean coercible = coercing ? DeclaredTypeCoercions.supports(inferredType, declaredType) : declaredType == inferredType;
             if (coercible == false) {
                 throw new IllegalArgumentException(
                     "declared type ["

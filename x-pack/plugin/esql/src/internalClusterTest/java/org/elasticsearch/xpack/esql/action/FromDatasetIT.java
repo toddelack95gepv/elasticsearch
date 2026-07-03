@@ -235,6 +235,7 @@ public class FromDatasetIT extends AbstractEsqlIntegTestCase {
         "employees_strict_coerce",
         "employees_strict_uncoercible",
         "employees_strict_coerce_multi",
+        "employees_int_to_long",
         "logs_parquet_string_date"
     );
 
@@ -1278,6 +1279,39 @@ public class FromDatasetIT extends AbstractEsqlIntegTestCase {
             assertThat(rows.get(0).get(0), equalTo("1970-01-01T00:00:00.001Z"));
             assertThat(rows.get(1).get(0), equalTo("1970-01-01T00:00:00.002Z"));
             assertThat(rows.get(2).get(0), equalTo("1970-01-01T00:00:00.003Z"));
+        }
+    }
+
+    public void testStrictColumnarInt32ToLongCoerces() throws Exception {
+        // int32 (salary) declared `long` widens losslessly at read time — the same int->long coercion the ORC unit test
+        // exercises, via the same DeclaredTypeCoercions matrix both columnar readers consult (parquet/orc consistency).
+        assertAcked(client().execute(PutDataSourceAction.INSTANCE, putDataSourceRequest("local_ds", Map.of())));
+        Path parquet = writeParquetRenameFixture();
+        java.util.Map<String, DatasetFieldMapping> properties = new java.util.LinkedHashMap<>();
+        properties.put("id", new DatasetFieldMapping("long", "emp_no"));
+        properties.put("comp", new DatasetFieldMapping("long", "salary")); // int32 -> long coerce
+        DatasetMapping mapping = new DatasetMapping(new DatasetMapping.Mappings(DatasetMapping.Dynamic.FALSE, properties));
+        assertAcked(
+            client().execute(
+                PutDatasetAction.INSTANCE,
+                new PutDatasetAction.Request(
+                    TIMEOUT,
+                    TIMEOUT,
+                    "employees_int_to_long",
+                    "local_ds",
+                    parquet.toUri().toString(),
+                    null,
+                    new HashMap<>(Map.of("format", "parquet")),
+                    mapping
+                )
+            )
+        );
+        try (var response = run(syncEsqlQueryRequest("FROM employees_int_to_long | SORT comp | KEEP comp | LIMIT 10"), TIMEOUT)) {
+            List<List<Object>> rows = getValuesList(response);
+            assertThat(rows, hasSize(3));
+            assertThat(rows.get(0).get(0), equalTo(100L));
+            assertThat(rows.get(1).get(0), equalTo(200L));
+            assertThat(rows.get(2).get(0), equalTo(300L));
         }
     }
 

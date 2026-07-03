@@ -35,6 +35,7 @@ import org.apache.parquet.schema.Type;
 import org.apache.parquet.schema.Types;
 import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.common.breaker.CircuitBreakingException;
+import org.elasticsearch.common.time.DateFormatter;
 import org.elasticsearch.compute.data.Block;
 import org.elasticsearch.compute.data.BlockFactory;
 import org.elasticsearch.compute.data.Page;
@@ -56,6 +57,7 @@ import org.elasticsearch.xpack.esql.datasources.spi.ColumnBlockConversions;
 import org.elasticsearch.xpack.esql.datasources.spi.ColumnExtractor;
 import org.elasticsearch.xpack.esql.datasources.spi.ColumnExtractorAware;
 import org.elasticsearch.xpack.esql.datasources.spi.Configured;
+import org.elasticsearch.xpack.esql.datasources.spi.DeclaredTypeCoercions;
 import org.elasticsearch.xpack.esql.datasources.spi.DynamicThreshold;
 import org.elasticsearch.xpack.esql.datasources.spi.DynamicThresholdAware;
 import org.elasticsearch.xpack.esql.datasources.spi.FilterPushdownSupport;
@@ -121,6 +123,8 @@ public class ParquetFormatReader implements RangeAwareFormatReader, ColumnExtrac
     private final boolean optimizedReader;
     private final boolean lateMaterializationEnabled;
     private final DynamicThreshold dynamicThreshold;
+    /** Declared per-column date parse patterns (physical name &rarr; pattern); see {@link #withDeclaredDateFormats}. */
+    private final Map<String, String> declaredDateFormats;
     // Shared across all iterators created by this reader: holds lazy decompressor instances and
     // pays the per-codec init cost once. The factory is stateless across files/row groups.
     private final PlainCompressionCodecFactory codecFactory = new PlainCompressionCodecFactory();
@@ -205,11 +209,11 @@ public class ParquetFormatReader implements RangeAwareFormatReader, ColumnExtrac
     }
 
     public ParquetFormatReader(BlockFactory blockFactory) {
-        this(blockFactory, FilterCompat.NOOP, null, false, true, true, null);
+        this(blockFactory, FilterCompat.NOOP, null, false, true, true, null, Map.of());
     }
 
     ParquetFormatReader(BlockFactory blockFactory, boolean optimizedReader) {
-        this(blockFactory, FilterCompat.NOOP, null, false, optimizedReader, true, null);
+        this(blockFactory, FilterCompat.NOOP, null, false, optimizedReader, true, null, Map.of());
     }
 
     private ParquetFormatReader(
@@ -219,7 +223,8 @@ public class ParquetFormatReader implements RangeAwareFormatReader, ColumnExtrac
         boolean forceBaselinePath,
         boolean optimizedReader,
         boolean lateMaterializationEnabled,
-        DynamicThreshold dynamicThreshold
+        DynamicThreshold dynamicThreshold,
+        Map<String, String> declaredDateFormats
     ) {
         this.blockFactory = blockFactory;
         this.pushedFilter = pushedFilter;
@@ -228,6 +233,7 @@ public class ParquetFormatReader implements RangeAwareFormatReader, ColumnExtrac
         this.optimizedReader = optimizedReader;
         this.lateMaterializationEnabled = lateMaterializationEnabled;
         this.dynamicThreshold = dynamicThreshold;
+        this.declaredDateFormats = declaredDateFormats;
     }
 
     /**
@@ -243,7 +249,8 @@ public class ParquetFormatReader implements RangeAwareFormatReader, ColumnExtrac
             true,
             optimizedReader,
             lateMaterializationEnabled,
-            dynamicThreshold
+            dynamicThreshold,
+            declaredDateFormats
         );
     }
 
@@ -257,7 +264,8 @@ public class ParquetFormatReader implements RangeAwareFormatReader, ColumnExtrac
                 forceBaselinePath,
                 optimizedReader,
                 lateMaterializationEnabled,
-                dynamicThreshold
+                dynamicThreshold,
+                declaredDateFormats
             );
         }
         if (pushedFilter instanceof ParquetPushedExpressions exprs) {
@@ -268,7 +276,8 @@ public class ParquetFormatReader implements RangeAwareFormatReader, ColumnExtrac
                 forceBaselinePath,
                 optimizedReader,
                 lateMaterializationEnabled,
-                dynamicThreshold
+                dynamicThreshold,
+                declaredDateFormats
             );
         }
         return this;
@@ -283,7 +292,32 @@ public class ParquetFormatReader implements RangeAwareFormatReader, ColumnExtrac
             forceBaselinePath,
             optimizedReader,
             lateMaterializationEnabled,
-            threshold
+            threshold,
+            declaredDateFormats
+        );
+    }
+
+    /**
+     * Declared per-column date parse patterns, keyed by physical (file) column name. Consumed by the
+     * string&rarr;datetime declared coercion ({@code DeclaredTypeCoercions}): a BINARY string column whose planner
+     * attribute is {@code datetime} parses each value with this pattern (ISO default when absent). Unlike the text
+     * formats — where a declared format re-routes an existing text parse — parquet only ever consults this map for
+     * coerced string columns; native temporal columns carry their own unit and never text-parse.
+     */
+    @Override
+    public FormatReader withDeclaredDateFormats(Map<String, String> physicalNameToPattern) {
+        if (physicalNameToPattern == null || physicalNameToPattern.isEmpty()) {
+            return this;
+        }
+        return new ParquetFormatReader(
+            blockFactory,
+            pushedFilter,
+            pushedExpressions,
+            forceBaselinePath,
+            optimizedReader,
+            lateMaterializationEnabled,
+            dynamicThreshold,
+            Map.copyOf(physicalNameToPattern)
         );
     }
 
@@ -303,7 +337,8 @@ public class ParquetFormatReader implements RangeAwareFormatReader, ColumnExtrac
                 forceBaselinePath,
                 newOptimized,
                 newLateMat,
-                dynamicThreshold
+                dynamicThreshold,
+                declaredDateFormats
             );
         return Configured.fromKnownSubset(result, config, RECOGNIZED_KEYS);
     }
@@ -1125,7 +1160,8 @@ public class ParquetFormatReader implements RangeAwareFormatReader, ColumnExtrac
                 object.path().toString(),
                 hasRecordFilter,
                 rangeBlockGlobalOffsets,
-                counters
+                counters,
+                declaredDateFormats
             );
         } catch (Throwable t) {
             reader.close();
@@ -1153,7 +1189,7 @@ public class ParquetFormatReader implements RangeAwareFormatReader, ColumnExtrac
             );
         }
         ParquetStorageObjectAdapter adapter = (ParquetStorageObjectAdapter) inputFile;
-        ColumnInfo[] columnInfos = buildColumnInfos(projectedSchema, projectedAttributes);
+        ColumnInfo[] columnInfos = buildColumnInfos(projectedSchema, projectedAttributes, declaredDateFormats);
         validatePlannerTypesAgainstFile(logger, storageObject.path().toString(), reader, projectedAttributes, columnInfos);
 
         // Pass the predicate column names so the metadata preload also batch-fetches dictionary
@@ -1411,7 +1447,12 @@ public class ParquetFormatReader implements RangeAwareFormatReader, ColumnExtrac
      * Top-level fields are recognised via {@link MessageType#containsField}; leaf paths are
      * joined with {@code "."} (mirroring {@link ColumnChunkPrefetcher}'s prefetch key).
      */
+    /** Formatter-free overload for callers with no declared date formats (tests, extractor paths). */
     static ColumnInfo[] buildColumnInfos(MessageType projectedSchema, List<Attribute> attributes) {
+        return buildColumnInfos(projectedSchema, attributes, Map.of());
+    }
+
+    static ColumnInfo[] buildColumnInfos(MessageType projectedSchema, List<Attribute> attributes, Map<String, String> dateFormats) {
         ColumnInfo[] columnInfos = new ColumnInfo[attributes.size()];
         // Per-top-level-field descriptors handle LIST<primitive> and other cases where the
         // descriptor's first path segment is the user-visible field name. This map wins over
@@ -1447,13 +1488,17 @@ public class ParquetFormatReader implements RangeAwareFormatReader, ColumnExtrac
             }
             if (desc != null) {
                 LogicalTypeAnnotation logicalType = desc.getPrimitiveType().getLogicalTypeAnnotation();
+                // Declared per-column date format, keyed by the physical name the reader sees (the attribute name at
+                // this point). Resolved once per iterator; consumed only by the string->datetime coerced decode.
+                String declaredPattern = dateFormats.get(attr.name());
                 columnInfos[i] = new ColumnInfo(
                     desc,
                     desc.getPrimitiveType().getPrimitiveTypeName(),
                     attr.dataType(),
                     desc.getMaxDefinitionLevel(),
                     desc.getMaxRepetitionLevel(),
-                    logicalType
+                    logicalType,
+                    declaredPattern != null ? DateFormatter.forPattern(declaredPattern) : null
                 );
             }
         }
@@ -1803,11 +1848,14 @@ public class ParquetFormatReader implements RangeAwareFormatReader, ColumnExtrac
     }
 
     /**
-     * When the query plan type cannot be satisfied from this file's Parquet-derived ESQL type (after
-     * applying the same widening rules as {@link EsqlDataTypeConverter#commonType}, plus KEYWORD/TEXT
-     * interchangeability), emit a response Warning header (and log a warning) and read the column as
-     * null instead of failing at decode time. The warning header lets clients see — alongside other
-     * recoverable ES|QL warnings — exactly which columns were silently null-replaced.
+     * When the query plan type cannot be satisfied from this file's Parquet-derived ESQL type — neither by the same
+     * widening rules as {@link EsqlDataTypeConverter#commonType} (plus KEYWORD/TEXT interchangeability) nor by a
+     * declared-type coercion the decode paths implement ({@link DeclaredTypeCoercions#supports}) — emit a response
+     * Warning header (and log a warning) and read the column as null instead of failing at decode time. The warning
+     * header lets clients see — alongside other recoverable ES|QL warnings — exactly which columns were silently
+     * null-replaced. This is the per-file manifestation of the castability check the resolver already ran against the
+     * anchor footer: a multi-file glob can drift from the anchor, and a drifted file that is neither compatible nor
+     * coercible must not decode garbage.
      */
     private static void validatePlannerTypesAgainstFile(
         Logger logger,
@@ -1831,7 +1879,8 @@ public class ParquetFormatReader implements RangeAwareFormatReader, ColumnExtrac
                 continue;
             }
             DataType actualInFile = convertParquetTypeToEsql(resolved);
-            if (plannerTypeCompatibleWithFileDerivedType(attr.dataType(), actualInFile) == false) {
+            if (plannerTypeCompatibleWithFileDerivedType(attr.dataType(), actualInFile) == false
+                && DeclaredTypeCoercions.supports(actualInFile, attr.dataType()) == false) {
                 if (skipWarnings == null) {
                     skipWarnings = new SkipWarnings(
                         "Parquet file ["
@@ -1925,7 +1974,8 @@ public class ParquetFormatReader implements RangeAwareFormatReader, ColumnExtrac
             String fileLocation,
             boolean hasRecordFilter,
             long[] rowGroupFirstRowGlobalOverride,
-            ParquetReaderCounters counters
+            ParquetReaderCounters counters,
+            Map<String, String> declaredDateFormats
         ) {
             this.reader = reader;
             this.projectedSchema = projectedSchema;
@@ -1940,7 +1990,7 @@ public class ParquetFormatReader implements RangeAwareFormatReader, ColumnExtrac
 
             reader.setRequestedSchema(projectedSchema);
 
-            this.columnInfos = buildColumnInfos(projectedSchema, attributes);
+            this.columnInfos = buildColumnInfos(projectedSchema, attributes, declaredDateFormats);
             boolean foundListCol = false;
             int rowPosIdx = -1;
             for (int i = 0; i < columnInfos.length; i++) {
@@ -2392,10 +2442,16 @@ public class ParquetFormatReader implements RangeAwareFormatReader, ColumnExtrac
             BitSet isNull = info.maxDefLevel() > 0 ? new BitSet(rows) : null;
             boolean noNulls = true;
             boolean isDate = info.parquetType() == PrimitiveType.PrimitiveTypeName.INT32;
+            // Declared string->datetime coercion: a BINARY string column whose planner attribute is datetime parses
+            // each value with the column's declared format (ISO default) via the shared scalar. Physical INT64 with no
+            // timestamp annotation lands in the raw getLong() arm below - the epoch-millis reinterpret.
+            boolean isStringCoercion = info.parquetType() == PrimitiveType.PrimitiveTypeName.BINARY;
             for (int i = 0; i < rows; i++) {
                 if (info.maxDefLevel() > 0 && cr.getCurrentDefinitionLevel() < info.maxDefLevel()) {
                     isNull.set(i);
                     noNulls = false;
+                } else if (isStringCoercion) {
+                    values[i] = DeclaredTypeCoercions.parseDatetimeMillis(cr.getBinary().toStringUsingUTF8(), info.dateFormatter());
                 } else if (isDate) {
                     values[i] = ParquetColumnDecoding.dateDaysToMillis(cr.getInteger());
                 } else {

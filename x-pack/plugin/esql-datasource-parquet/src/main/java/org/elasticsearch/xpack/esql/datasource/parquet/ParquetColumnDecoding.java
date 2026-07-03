@@ -16,10 +16,15 @@ import org.apache.parquet.schema.GroupType;
 import org.apache.parquet.schema.LogicalTypeAnnotation;
 import org.apache.parquet.schema.PrimitiveType;
 import org.apache.parquet.schema.Type;
+import org.elasticsearch.common.time.DateFormatter;
 import org.elasticsearch.compute.data.Block;
 import org.elasticsearch.compute.data.BlockFactory;
+import org.elasticsearch.compute.data.BytesRefBlock;
+import org.elasticsearch.compute.data.LongBlock;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.core.util.NumericUtils;
+import org.elasticsearch.xpack.esql.datasources.spi.DeclaredTypeCoercions;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -60,6 +65,43 @@ final class ParquetColumnDecoding {
     /** Converts a date32 value (days since epoch) to epoch milliseconds. */
     static long dateDaysToMillis(long days) {
         return days * MILLIS_PER_DAY;
+    }
+
+    /**
+     * Declared string&rarr;datetime coercion over an already-decoded bytes block: parses every value with the
+     * column's declared format (ISO default when {@code null}) via the shared
+     * {@link DeclaredTypeCoercions#parseDatetimeMillis} scalar — the same conversion the text readers apply at
+     * parse time, so identical bytes with an identical declared format yield the identical instant. Preserves
+     * nulls and multi-value positions. Does NOT take ownership of {@code source}; the caller closes it.
+     * An unparseable value throws — the read fails loudly, never a silent null.
+     */
+    static Block bytesBlockToDatetimeMillis(Block source, @Nullable DateFormatter dateFormatter, BlockFactory blockFactory) {
+        int positions = source.getPositionCount();
+        if (source.areAllValuesNull()) {
+            return blockFactory.newConstantNullBlock(positions);
+        }
+        BytesRefBlock bytes = (BytesRefBlock) source;
+        BytesRef scratch = new BytesRef();
+        try (LongBlock.Builder builder = blockFactory.newLongBlockBuilder(positions)) {
+            for (int pos = 0; pos < positions; pos++) {
+                int count = bytes.getValueCount(pos);
+                if (bytes.isNull(pos) || count == 0) {
+                    builder.appendNull();
+                } else if (count == 1) {
+                    BytesRef value = bytes.getBytesRef(bytes.getFirstValueIndex(pos), scratch);
+                    builder.appendLong(DeclaredTypeCoercions.parseDatetimeMillis(value.utf8ToString(), dateFormatter));
+                } else {
+                    int firstIdx = bytes.getFirstValueIndex(pos);
+                    builder.beginPositionEntry();
+                    for (int v = 0; v < count; v++) {
+                        BytesRef value = bytes.getBytesRef(firstIdx + v, scratch);
+                        builder.appendLong(DeclaredTypeCoercions.parseDatetimeMillis(value.utf8ToString(), dateFormatter));
+                    }
+                    builder.endPositionEntry();
+                }
+            }
+            return builder.build();
+        }
     }
 
     /**
@@ -355,7 +397,13 @@ final class ParquetColumnDecoding {
     private static Block readListDatetimeColumn(ColumnReader cr, ColumnInfo info, int rows, BlockFactory blockFactory) {
         try (var builder = blockFactory.newLongBlockBuilder(rows)) {
             int maxDef = info.maxDefLevel();
-            Runnable appender = () -> builder.appendLong(convertTimestampToMillis(cr.getLong(), info.logicalType()));
+            // Declared string->datetime coercion for LIST<string> columns: parse each element via the shared
+            // scalar with the column's declared format (ISO default), mirroring the flat decode paths.
+            Runnable appender = info.parquetType() == PrimitiveType.PrimitiveTypeName.BINARY
+                ? () -> builder.appendLong(
+                    DeclaredTypeCoercions.parseDatetimeMillis(cr.getBinary().toStringUsingUTF8(), info.dateFormatter())
+                )
+                : () -> builder.appendLong(convertTimestampToMillis(cr.getLong(), info.logicalType()));
             for (int row = 0; row < rows; row++) {
                 readListRow(cr, maxDef, builder, appender);
             }

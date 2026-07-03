@@ -36,6 +36,7 @@ import org.apache.orc.StripeStatistics;
 import org.apache.orc.TypeDescription;
 import org.apache.orc.impl.OrcTail;
 import org.apache.orc.impl.ReaderImpl;
+import org.elasticsearch.common.time.DateFormatter;
 import org.elasticsearch.compute.data.Block;
 import org.elasticsearch.compute.data.BlockFactory;
 import org.elasticsearch.compute.data.ElementType;
@@ -58,6 +59,7 @@ import org.elasticsearch.xpack.esql.datasources.cache.ParsedFooterCache;
 import org.elasticsearch.xpack.esql.datasources.spi.AggregatePushdownSupport;
 import org.elasticsearch.xpack.esql.datasources.spi.ColumnBlockConversions;
 import org.elasticsearch.xpack.esql.datasources.spi.ColumnExtractor;
+import org.elasticsearch.xpack.esql.datasources.spi.DeclaredTypeCoercions;
 import org.elasticsearch.xpack.esql.datasources.spi.DynamicThreshold;
 import org.elasticsearch.xpack.esql.datasources.spi.DynamicThresholdAware;
 import org.elasticsearch.xpack.esql.datasources.spi.FilterPushdownSupport;
@@ -70,9 +72,11 @@ import org.elasticsearch.xpack.esql.datasources.spi.RangeAwareFormatReader.Split
 import org.elasticsearch.xpack.esql.datasources.spi.RangeReadContext;
 import org.elasticsearch.xpack.esql.datasources.spi.RowPositionStrategy;
 import org.elasticsearch.xpack.esql.datasources.spi.SimpleSourceMetadata;
+import org.elasticsearch.xpack.esql.datasources.spi.SkipWarnings;
 import org.elasticsearch.xpack.esql.datasources.spi.SourceMetadata;
 import org.elasticsearch.xpack.esql.datasources.spi.SourceStatistics;
 import org.elasticsearch.xpack.esql.datasources.spi.StorageObject;
+import org.elasticsearch.xpack.esql.type.EsqlDataTypeConverter;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -131,37 +135,55 @@ public class OrcFormatReader implements RangeAwareFormatReader, NoConfigFormatRe
     private final OrcPushedExpressions pushedExpressions;
     private final OrcReaderCounters counters = new OrcReaderCounters();
     private final DynamicThreshold dynamicThreshold;
+    /** Declared per-column date parse patterns (physical name &rarr; pattern); see {@link #withDeclaredDateFormats}. */
+    private final Map<String, String> declaredDateFormats;
 
     public OrcFormatReader(BlockFactory blockFactory) {
-        this(blockFactory, null, null, null);
+        this(blockFactory, null, null, null, Map.of());
     }
 
     private OrcFormatReader(
         BlockFactory blockFactory,
         SearchArgument pushedFilter,
         OrcPushedExpressions pushedExpressions,
-        DynamicThreshold dynamicThreshold
+        DynamicThreshold dynamicThreshold,
+        Map<String, String> declaredDateFormats
     ) {
         this.blockFactory = blockFactory;
         this.pushedFilter = pushedFilter;
         this.pushedExpressions = pushedExpressions;
         this.dynamicThreshold = dynamicThreshold;
+        this.declaredDateFormats = declaredDateFormats;
     }
 
     @Override
     public FormatReader withPushedFilter(Object pushedFilter) {
         if (pushedFilter instanceof SearchArgument sarg) {
-            return new OrcFormatReader(this.blockFactory, sarg, null, dynamicThreshold);
+            return new OrcFormatReader(this.blockFactory, sarg, null, dynamicThreshold, declaredDateFormats);
         }
         if (pushedFilter instanceof OrcPushedExpressions exprs) {
-            return new OrcFormatReader(this.blockFactory, null, exprs, dynamicThreshold);
+            return new OrcFormatReader(this.blockFactory, null, exprs, dynamicThreshold, declaredDateFormats);
         }
         return this;
     }
 
     @Override
     public FormatReader withDynamicThreshold(DynamicThreshold threshold) {
-        return new OrcFormatReader(blockFactory, pushedFilter, pushedExpressions, threshold);
+        return new OrcFormatReader(blockFactory, pushedFilter, pushedExpressions, threshold, declaredDateFormats);
+    }
+
+    /**
+     * Declared per-column date parse patterns, keyed by physical (file) column name. Consumed by the
+     * string&rarr;datetime declared coercion ({@code DeclaredTypeCoercions}): a string column whose planner attribute
+     * is {@code datetime} parses each value with this pattern (ISO default when absent). Native TIMESTAMP/DATE columns
+     * carry their own encoding and never text-parse.
+     */
+    @Override
+    public FormatReader withDeclaredDateFormats(Map<String, String> physicalNameToPattern) {
+        if (physicalNameToPattern == null || physicalNameToPattern.isEmpty()) {
+            return this;
+        }
+        return new OrcFormatReader(blockFactory, pushedFilter, pushedExpressions, dynamicThreshold, Map.copyOf(physicalNameToPattern));
     }
 
     @Override
@@ -402,7 +424,9 @@ public class OrcFormatReader implements RangeAwareFormatReader, NoConfigFormatRe
             batchSize,
             blockFactory,
             StripeSkipTable.build(reader, schema, dynamicThreshold, 0L, Long.MAX_VALUE),
-            counters
+            counters,
+            declaredDateFormats,
+            object.path().toString()
         );
         return rowLimit != NO_LIMIT ? new RowLimitingIterator(iter, rowLimit) : iter;
     }
@@ -543,7 +567,9 @@ public class OrcFormatReader implements RangeAwareFormatReader, NoConfigFormatRe
             batchSize,
             blockFactory,
             StripeSkipTable.build(reader, schema, dynamicThreshold, rangeStart, rangeEnd),
-            counters
+            counters,
+            declaredDateFormats,
+            object.path().toString()
         );
     }
 
@@ -1110,6 +1136,18 @@ public class OrcFormatReader implements RangeAwareFormatReader, NoConfigFormatRe
          * Attributes absent from the file map to {@code null}.
          */
         private final Map<String, int[]> fieldNameToPath;
+        /**
+         * Per-projected-attribute leaf {@link TypeDescription} in the FILE's schema ({@code null} for columns absent
+         * from the file and for the synthetic {@code _rowPosition}). Carries the physical side of a declared-type
+         * coercion: the block conversion needs it to tell an ORC {@code DATE} (days since epoch, LongColumnVector)
+         * apart from a {@code bigint} declared {@code datetime} (raw epoch millis, also LongColumnVector).
+         */
+        private final TypeDescription[] leafTypes;
+        /**
+         * Per-projected-attribute declared date parse pattern ({@code null} when none declared), resolved once from
+         * the reader's {@code declaredDateFormats}. Consumed only by the string&rarr;datetime coerced conversion.
+         */
+        private final DateFormatter[] declaredFormatters;
         /** Index of the synthetic {@code _rowPosition} attribute, or {@code -1} when not projected. */
         private final int rowPositionColumnIndex;
         /**
@@ -1129,7 +1167,9 @@ public class OrcFormatReader implements RangeAwareFormatReader, NoConfigFormatRe
             int batchSize,
             BlockFactory blockFactory,
             StripeSkipTable stripeSkipTable,
-            OrcReaderCounters counters
+            OrcReaderCounters counters,
+            Map<String, String> declaredDateFormats,
+            String fileLocation
         ) {
             this.reader = reader;
             this.rows = rows;
@@ -1142,25 +1182,99 @@ public class OrcFormatReader implements RangeAwareFormatReader, NoConfigFormatRe
             this.rowPositionColumnIndex = SyntheticColumns.rowPositionIndexInAttributes(attributes);
 
             this.fieldNameToPath = new HashMap<>(attributes.size());
+            this.leafTypes = new TypeDescription[attributes.size()];
+            this.declaredFormatters = new DateFormatter[attributes.size()];
             // Top-level field index, computed once for literal-name lookups.
             Map<String, Integer> topLevelToIndex = new HashMap<>();
             List<String> topLevelNames = schema.getFieldNames();
             for (int i = 0; i < topLevelNames.size(); i++) {
                 topLevelToIndex.put(topLevelNames.get(i), i);
             }
-            for (Attribute attr : attributes) {
+            for (int col = 0; col < attributes.size(); col++) {
+                Attribute attr = attributes.get(col);
                 String name = attr.name();
-                if (fieldNameToPath.containsKey(name)) {
-                    continue;
+                int[] path = fieldNameToPath.get(name);
+                if (path == null) {
+                    Integer topLevelIdx = topLevelToIndex.get(name);
+                    path = topLevelIdx != null ? new int[] { topLevelIdx } : resolveDottedPath(schema, name);
+                    if (path != null) {
+                        fieldNameToPath.put(name, path);
+                    }
                 }
-                Integer topLevelIdx = topLevelToIndex.get(name);
-                if (topLevelIdx != null) {
-                    fieldNameToPath.put(name, new int[] { topLevelIdx });
-                    continue;
-                }
-                int[] path = resolveDottedPath(schema, name);
                 if (path != null) {
-                    fieldNameToPath.put(name, path);
+                    leafTypes[col] = leafTypeForPath(schema, path);
+                }
+                String pattern = declaredDateFormats.get(name);
+                if (pattern != null) {
+                    declaredFormatters[col] = DateFormatter.forPattern(pattern);
+                }
+            }
+            validatePlannerTypesAgainstFile(fileLocation);
+        }
+
+        /** Walks {@code path} down the file schema's STRUCT children to the leaf {@link TypeDescription}. */
+        private static TypeDescription leafTypeForPath(TypeDescription schema, int[] path) {
+            TypeDescription current = schema;
+            for (int idx : path) {
+                current = current.getChildren().get(idx);
+            }
+            return current;
+        }
+
+        /**
+         * The per-file manifestation of the declared-coercion castability check ({@code DeclaredTypeCoercions}): a
+         * projected attribute whose planner type can be satisfied from this file's ORC-derived type — same type, a
+         * {@link EsqlDataTypeConverter#commonType} widening, or a supported coercion — decodes; anything else emits a
+         * response Warning header (and a log warning) and reads as null instead of decoding garbage or failing with a
+         * vector class cast. Mirrors the Parquet reader's {@code validatePlannerTypesAgainstFile}: the resolver has
+         * already fail-fasted against the anchor footer, but a multi-file glob can drift from the anchor.
+         */
+        private void validatePlannerTypesAgainstFile(String fileLocation) {
+            SkipWarnings skipWarnings = null;
+            for (int col = 0; col < attributes.size(); col++) {
+                Attribute attr = attributes.get(col);
+                TypeDescription leafType = leafTypes[col];
+                if (leafType == null || col == rowPositionColumnIndex) {
+                    continue;
+                }
+                DataType planner = attr.dataType();
+                if (planner == DataType.NULL || planner == DataType.UNSUPPORTED) {
+                    continue;
+                }
+                DataType actualInFile = convertOrcTypeToEsql(leafType);
+                DataType widened = EsqlDataTypeConverter.commonType(planner, actualInFile);
+                boolean compatible = planner == actualInFile
+                    || (widened != null && widened == planner)
+                    || DeclaredTypeCoercions.supports(actualInFile, planner);
+                if (compatible == false) {
+                    if (skipWarnings == null) {
+                        skipWarnings = new SkipWarnings(
+                            "ORC file ["
+                                + fileLocation
+                                + "] has columns whose on-disk type is incompatible with the planner type; "
+                                + "they are returned as null"
+                        );
+                    }
+                    skipWarnings.add(
+                        "Column ["
+                            + attr.name()
+                            + "] in file ["
+                            + fileLocation
+                            + "] has type ["
+                            + actualInFile
+                            + "] incompatible with planner type ["
+                            + planner
+                            + "]; returning nulls for this column"
+                    );
+                    LOGGER.warn(
+                        "Column [{}] in file [{}] has type [{}] incompatible with planner type [{}]; " + "returning nulls for this column",
+                        attr.name(),
+                        fileLocation,
+                        actualInFile,
+                        planner
+                    );
+                    fieldNameToPath.remove(attr.name());
+                    leafTypes[col] = null;
                 }
             }
         }
@@ -1311,7 +1425,7 @@ public class OrcFormatReader implements RangeAwareFormatReader, NoConfigFormatRe
                     if (vector == null) {
                         continue;
                     }
-                    blocks[col] = createBlock(vector, dataType, rowCount, ancestorNulls);
+                    blocks[col] = createBlock(vector, dataType, rowCount, ancestorNulls, leafTypes[col], declaredFormatters[col]);
                 } catch (Exception e) {
                     Releasables.closeExpectNoException(blocks);
                     throw e;
@@ -1360,13 +1474,24 @@ public class OrcFormatReader implements RangeAwareFormatReader, NoConfigFormatRe
          * inline {@code readFromZero} pattern in the bytes/decimal/datetime paths) so positions
          * {@code >0} read the only meaningful slot ({@code 0}) rather than stale data.
          */
-        private Block createBlock(ColumnVector vector, DataType dataType, int rowCount, BitSet ancestorNulls) {
+        private Block createBlock(
+            ColumnVector vector,
+            DataType dataType,
+            int rowCount,
+            BitSet ancestorNulls,
+            TypeDescription leafType,
+            DateFormatter dateFormatter
+        ) {
             if (vector instanceof ListColumnVector listCol) {
                 // LIST<primitive> is unreachable below a STRUCT ancestor today (LIST<STRUCT> is
                 // intentionally unsupported); fall back to the existing path which does not
                 // consume ancestorNulls. If/when nested LIST<primitive> projection is added the
                 // listCol path needs the same OR.
-                return createListBlock(listCol, dataType, rowCount);
+                // The element's file type drives the LIST<datetime> decode the same way leafType drives the flat one.
+                TypeDescription elementType = leafType != null
+                    && leafType.getChildren() != null
+                    && leafType.getChildren().isEmpty() == false ? leafType.getChildren().get(0) : null;
+                return createListBlock(listCol, dataType, rowCount, elementType, dateFormatter);
             }
             boolean ancestorContributes = ancestorNulls != null && ancestorNulls.isEmpty() == false;
             boolean effectiveNoNulls = vector.noNulls && ancestorContributes == false;
@@ -1409,7 +1534,15 @@ public class OrcFormatReader implements RangeAwareFormatReader, NoConfigFormatRe
                 );
                 case DOUBLE -> createDoubleBlock(vector, rowCount, effectiveNoNulls, leafNulls, effectiveRepeating, expandRepeating);
                 case KEYWORD, TEXT -> createBytesRefBlock(vector, rowCount, effectiveNoNulls, leafNulls, effectiveRepeating);
-                case DATETIME -> createDatetimeBlock(vector, rowCount, effectiveNoNulls, leafNulls, effectiveRepeating);
+                case DATETIME -> createDatetimeBlock(
+                    vector,
+                    rowCount,
+                    effectiveNoNulls,
+                    leafNulls,
+                    effectiveRepeating,
+                    leafType,
+                    dateFormatter
+                );
                 default -> blockFactory.newConstantNullBlock(rowCount);
             };
         }
@@ -1463,14 +1596,20 @@ public class OrcFormatReader implements RangeAwareFormatReader, NoConfigFormatRe
             return ColumnBlockConversions.toBitSet(vector.isNull, rowCount);
         }
 
-        private Block createListBlock(ListColumnVector listCol, DataType elementType, int rowCount) {
+        private Block createListBlock(
+            ListColumnVector listCol,
+            DataType elementType,
+            int rowCount,
+            TypeDescription elementFileType,
+            DateFormatter dateFormatter
+        ) {
             return switch (elementType) {
                 case KEYWORD, TEXT -> createListBytesRefBlock(listCol, rowCount);
                 case INTEGER -> createListIntBlock(listCol, rowCount);
                 case LONG -> createListLongBlock(listCol, rowCount);
                 case DOUBLE -> createListDoubleBlock(listCol, rowCount);
                 case BOOLEAN -> createListBooleanBlock(listCol, rowCount);
-                case DATETIME -> createListDatetimeBlock(listCol, rowCount);
+                case DATETIME -> createListDatetimeBlock(listCol, rowCount, elementFileType, dateFormatter);
                 default -> blockFactory.newConstantNullBlock(rowCount);
             };
         }
@@ -1614,8 +1753,16 @@ public class OrcFormatReader implements RangeAwareFormatReader, NoConfigFormatRe
             }
         }
 
-        private Block createListDatetimeBlock(ListColumnVector listCol, int rowCount) {
+        private Block createListDatetimeBlock(
+            ListColumnVector listCol,
+            int rowCount,
+            TypeDescription elementFileType,
+            DateFormatter dateFormatter
+        ) {
             ColumnVector child = listCol.child;
+            // Same discriminator as the flat datetime path: ORC DATE elements store days (scale to
+            // millis); integer elements declared `datetime` are already epoch millis (reinterpret).
+            long scale = elementFileType == null || elementFileType.getCategory() == TypeDescription.Category.DATE ? MILLIS_PER_DAY : 1L;
             try (var builder = blockFactory.newLongBlockBuilder(rowCount)) {
                 for (int i = 0; i < rowCount; i++) {
                     if (listCol.noNulls == false && listCol.isNull[i]) {
@@ -1637,7 +1784,21 @@ public class OrcFormatReader implements RangeAwareFormatReader, NoConfigFormatRe
                                 if (lv.noNulls == false && lv.isNull[idx]) {
                                     millis = 0L;
                                 } else {
-                                    millis = lv.vector[idx] * MILLIS_PER_DAY;
+                                    millis = lv.vector[idx] * scale;
+                                }
+                            } else if (child instanceof BytesColumnVector bv) {
+                                // Declared string->datetime coercion on LIST<string> elements: shared scalar,
+                                // declared format (ISO default). Unparseable values fail the read loudly.
+                                if (bv.noNulls == false && bv.isNull[idx]) {
+                                    millis = 0L;
+                                } else {
+                                    String value = new String(
+                                        bv.vector[idx],
+                                        bv.start[idx],
+                                        bv.length[idx],
+                                        java.nio.charset.StandardCharsets.UTF_8
+                                    );
+                                    millis = DeclaredTypeCoercions.parseDatetimeMillis(value, dateFormatter);
                                 }
                             } else {
                                 throw new IllegalArgumentException(
@@ -1792,7 +1953,9 @@ public class OrcFormatReader implements RangeAwareFormatReader, NoConfigFormatRe
             int rowCount,
             boolean effectiveNoNulls,
             BitSet effectiveNulls,
-            boolean effectiveRepeating
+            boolean effectiveRepeating,
+            TypeDescription leafType,
+            DateFormatter dateFormatter
         ) {
             if (vector instanceof TimestampColumnVector tsVector) {
                 if (effectiveRepeating) {
@@ -1819,27 +1982,58 @@ public class OrcFormatReader implements RangeAwareFormatReader, NoConfigFormatRe
                 }
                 return blockFactory.newLongArrayBlock(millis, rowCount, null, effectiveNulls, Block.MvOrdering.UNORDERED);
             } else if (vector instanceof LongColumnVector longVector) {
+                // Two file types land here and need opposite scaling: an ORC DATE stores days since
+                // epoch (scale to millis), while an integer column declared `datetime`
+                // (DeclaredTypeCoercions LONG->DATETIME) already stores epoch millis (reinterpret,
+                // no scaling). The file schema's leaf category is the discriminator; DATE is the
+                // historical default for a null leaf type (pre-coercion, DATE was the only
+                // LongColumnVector source that mapped to DATETIME).
+                long scale = leafType == null || leafType.getCategory() == TypeDescription.Category.DATE ? MILLIS_PER_DAY : 1L;
                 if (effectiveRepeating) {
                     if (effectiveNoNulls == false && (longVector.isNull[0] || (effectiveNulls != null && effectiveNulls.get(0)))) {
                         return blockFactory.newConstantNullBlock(rowCount);
                     }
-                    return blockFactory.newConstantLongBlockWith(longVector.vector[0] * MILLIS_PER_DAY, rowCount);
+                    return blockFactory.newConstantLongBlockWith(longVector.vector[0] * scale, rowCount);
                 }
                 long[] millis = new long[rowCount];
                 if (vector.isRepeating) {
-                    long v0 = longVector.vector[0] * MILLIS_PER_DAY;
+                    long v0 = longVector.vector[0] * scale;
                     for (int i = 0; i < rowCount; i++) {
                         millis[i] = v0;
                     }
                 } else {
                     for (int i = 0; i < rowCount; i++) {
-                        millis[i] = longVector.vector[i] * MILLIS_PER_DAY;
+                        millis[i] = longVector.vector[i] * scale;
                     }
                 }
                 if (effectiveNoNulls) {
                     return blockFactory.newLongArrayVector(millis, rowCount).asBlock();
                 }
                 return blockFactory.newLongArrayBlock(millis, rowCount, null, effectiveNulls, Block.MvOrdering.UNORDERED);
+            } else if (vector instanceof BytesColumnVector bytesVector) {
+                // Declared string->datetime coercion: parse each value with the column's declared
+                // format (ISO default) via the shared DeclaredTypeCoercions scalar - the same
+                // conversion the text readers apply at parse time. An unparseable value fails the
+                // read loudly, never a silent null.
+                try (var builder = blockFactory.newLongBlockBuilder(rowCount)) {
+                    for (int i = 0; i < rowCount; i++) {
+                        int idx = bytesVector.isRepeating ? 0 : i;
+                        boolean isNull = (effectiveNoNulls == false && effectiveNulls != null && effectiveNulls.get(i))
+                            || (bytesVector.noNulls == false && bytesVector.isNull[idx]);
+                        if (isNull) {
+                            builder.appendNull();
+                        } else {
+                            String value = new String(
+                                bytesVector.vector[idx],
+                                bytesVector.start[idx],
+                                bytesVector.length[idx],
+                                java.nio.charset.StandardCharsets.UTF_8
+                            );
+                            builder.appendLong(DeclaredTypeCoercions.parseDatetimeMillis(value, dateFormatter));
+                        }
+                    }
+                    return builder.build();
+                }
             }
             return blockFactory.newConstantNullBlock(rowCount);
         }

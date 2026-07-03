@@ -26,6 +26,7 @@ import org.elasticsearch.xpack.esql.datasources.cache.ListingCacheKey;
 import org.elasticsearch.xpack.esql.datasources.cache.SchemaCacheEntry;
 import org.elasticsearch.xpack.esql.datasources.cache.SchemaCacheKey;
 import org.elasticsearch.xpack.esql.datasources.glob.GlobExpander;
+import org.elasticsearch.xpack.esql.datasources.spi.DeclaredTypeCoercions;
 import org.elasticsearch.xpack.esql.datasources.spi.ExternalSourceFactory;
 import org.elasticsearch.xpack.esql.datasources.spi.ExternalSourceMetrics;
 import org.elasticsearch.xpack.esql.datasources.spi.FileList;
@@ -471,9 +472,10 @@ public class ExternalSourceResolver {
     /**
      * Strict single-file resolution: the declared mapping is the entire schema, so text formats need no inference — the
      * declaration is content-independent and only the file's size/mtime is read (for split planning, the same data-read
-     * requirement the inferred path has). Columnar formats are the one exception: {@link #rejectStrictColumnarTypeMismatch}
-     * reads the footer (cached) to validate the declared types against the file's own, so a mismatch fails loud rather
-     * than yielding silent nulls. Both the user-facing output and the per-file schema carry
+     * requirement the inferred path has). Columnar formats are the one exception:
+     * {@link #rejectStrictColumnarUncoercibleTypes} reads the footer (cached) to validate the declared types against
+     * the file's own — a coercible pair (e.g. {@code int64} declared {@code datetime}) is coerced by the reader at
+     * decode time, an uncoercible one fails loud rather than yielding silent nulls. Both the user-facing output and the per-file schema carry
      * the declared <b>logical</b> names (identity column mapping); a {@code path} rename is applied to physical only at
      * the reader boundary via {@link PhysicalNames}, so the operator and reconciliation stay in logical space.
      */
@@ -493,11 +495,11 @@ public class ExternalSourceResolver {
         // FormatNameResolver, which applies the same reader-then-format-then-extension precedence (and lowercasing)
         // as the inferred path. A hand-rolled `format` check here would miss both and mis-key the dispatch.
         String sourceType = FormatNameResolver.resolve(config, path);
-        // Cheap no-I/O guard first (format-on-columnar; no partitions on a single file), then the columnar type check
-        // which reads this file's footer (cached when the provider is).
-        rejectDeclaredMappingViolations(sourceType, null, declaredMapping);
+        // Cheap no-I/O guard first (no partitions on a single file), then the columnar coercibility check which reads
+        // this file's footer (cached when the provider is).
+        rejectDeclaredMappingViolations(null, declaredMapping);
         Instant singleMtime = object.lastModified();
-        rejectStrictColumnarTypeMismatch(
+        rejectStrictColumnarUncoercibleTypes(
             sourceType,
             provider,
             storagePath,
@@ -532,8 +534,9 @@ public class ExternalSourceResolver {
     /**
      * Strict multi-file resolution: the declared mapping is the entire schema for every file, so text formats need only
      * the glob listed — no per-file metadata reads. Columnar formats are the one exception:
-     * {@link #rejectStrictColumnarTypeMismatch} reads one anchor file's footer (cached) to validate the declared types.
-     * Each file resolves to the declared schema (identity mapping).
+     * {@link #rejectStrictColumnarUncoercibleTypes} reads one anchor file's footer (cached) to validate the declared
+     * types (coercible pairs are coerced by the reader at decode time). Each file resolves to the declared schema
+     * (identity mapping).
      */
     private ExternalSourceResolution.ResolvedSource resolveStrictMultiFile(
         String path,
@@ -577,14 +580,14 @@ public class ExternalSourceResolver {
         // (partition wins, Spark/DuckDB semantics), but under strict the declaration drives the reader's file schema
         // — text formats bind positionally — so silently dropping a declared column would silently re-bind the rest.
         // A declared column colliding with a partition key is rejected instead: partition columns need no declaring.
-        // Cheap no-I/O guards first (format-on-columnar + partition collision); strict skips only rejectFileTypedRetypes,
-        // which needs an inferred schema strict never reads.
+        // Cheap no-I/O guard first (partition collision); strict skips only rejectUncoercibleFileTypedRetypes against
+        // the unified schema, which needs an inferred schema strict never reads — the anchor-footer check below covers it.
         PartitionMetadata partitionMetadata = listing.partitionMetadata();
-        rejectDeclaredMappingViolations(sourceType, partitionMetadata, declaredMapping);
-        // Then the columnar type check, which reads the anchor footer — re-check cancellation first, as a wide glob's
-        // listing above can be slow (mirrors resolveMultiFileSource's pre-footer re-check).
+        rejectDeclaredMappingViolations(partitionMetadata, declaredMapping);
+        // Then the columnar coercibility check, which reads the anchor footer — re-check cancellation first, as a wide
+        // glob's listing above can be slow (mirrors resolveMultiFileSource's pre-footer re-check).
         throwIfCancelled();
-        rejectStrictColumnarTypeMismatch(sourceType, provider, listing.path(0), listing.lastModifiedMillis(0), config, declaredMapping);
+        rejectStrictColumnarUncoercibleTypes(sourceType, provider, listing.path(0), listing.lastModifiedMillis(0), config, declaredMapping);
 
         ExternalSourceMetadata extMetadata = wrapAsExternalSourceMetadata(
             new SimpleSourceMetadata(logicalSchema, sourceType, path),
@@ -611,15 +614,16 @@ public class ExternalSourceResolver {
      */
     /**
      * Formats whose readers emit blocks in the FILE's own types (self-typed / columnar) rather than parsing text into
-     * whatever type the schema requests. For these, a declared retype cannot change what the reader produces — the
-     * declared type must equal the reconciled (inferred) type or the query would fail deep in the engine with a block
-     * type mismatch. Same reason a declared date {@code format} (a text-parse pattern) is meaningless here. Text formats
-     * (CSV/TSV/NDJSON) parse into the declared type, so they are absent. {@code parquet-rs} is the native parquet reader
-     * (feature-flagged) — columnar like {@code parquet}, so it belongs here too.
+     * whatever type the schema requests. For these, a declared retype only works when the reader can coerce the
+     * physical type into the declared one at decode time ({@link DeclaredTypeCoercions#supports}); any other pair
+     * would fail deep in the engine with a block type mismatch — or worse, silently read as {@code null} — so it is
+     * rejected at resolution instead. Text formats (CSV/TSV/NDJSON) parse into the declared type, so they are absent.
+     * {@code parquet-rs} is the native parquet reader (feature-flagged) — columnar like {@code parquet}, so it belongs
+     * here too.
      * <p>
-     * Three rejects gate on this set: {@link #rejectDeclaredFormatOnColumnar}, {@link #rejectStrictColumnarTypeMismatch},
-     * and the non-strict {@link #rejectFileTypedRetypes}. Removing an entry silently disables all three for that format;
-     * adding a columnar reader without adding its {@code formatName()} here lets a declared format/retype slip through.
+     * Two checks gate on this set: {@link #rejectStrictColumnarUncoercibleTypes} and the non-strict
+     * {@link #rejectUncoercibleFileTypedRetypes}. Removing an entry silently disables both for that format; adding a
+     * columnar reader without adding its {@code formatName()} here lets a declared retype slip through unvalidated.
      * {@code ExternalSourceResolverTests#testFileTypedFormatsGatesColumnarRejects} pins the membership so either drift
      * is a test failure.
      * TODO: this classification belongs on the {@code FormatReader} SPI (a capability method) — move it there with the
@@ -628,48 +632,24 @@ public class ExternalSourceResolver {
     static final Set<String> FILE_TYPED_FORMATS = Set.of("parquet", "orc", FormatNameResolver.FORMAT_PARQUET_RS);
 
     /**
-     * The declaration-vs-source violations detectable without reading file content: a declared {@code format} on a
-     * columnar format, and a declared column colliding with a hive partition key. Every declaration resolution path
-     * (strict single/multi and the non-strict overlay) funnels through this one guard so enforcement stays uniform and
-     * a future path cannot silently skip a check. The type-vs-file check ({@link #rejectFileTypedRetypes}) is
-     * non-strict-only because it needs the inferred schema strict never reads.
+     * The file-typed formats whose readers implement declared-type coercion in their decode paths
+     * ({@link DeclaredTypeCoercions}). {@code parquet-rs} is deliberately absent: its zero-copy Arrow-buffer blocks
+     * are produced by the Arrow type alone (see {@code ArrowToEsql}) with no per-column coercion hook yet, so it keeps
+     * the strict declared-type-must-equal-file-type check — the pre-coercion behavior — until its conversion layer
+     * grows the same {@link DeclaredTypeCoercions} calls. Pinned alongside {@link #FILE_TYPED_FORMATS} by
+     * {@code ExternalSourceResolverTests#testFileTypedFormatsGatesColumnarRejects}.
      */
-    private static void rejectDeclaredMappingViolations(
-        String sourceType,
-        @Nullable PartitionMetadata partitionMetadata,
-        DatasetMapping declaredMapping
-    ) {
-        rejectDeclaredFormatOnColumnar(sourceType, declaredMapping);
-        rejectDeclaredPartitionCollision(partitionMetadata, declaredMapping);
-    }
+    static final Set<String> COERCING_FILE_TYPED_FORMATS = Set.of("parquet", "orc");
 
     /**
-     * Rejects a declared date {@code format} on a columnar ({@code parquet}/{@code orc}) dataset column, for BOTH strict
-     * and non-strict declarations (the type-match reject below only runs on the non-strict overlay, but a format is
-     * meaningless on columnar regardless of mode). A {@code format} is a text-parse pattern; columnar formats carry
-     * native typed values and never text-parse, so the declared format could never take effect — reject loudly at
-     * resolution rather than silently ignore it. No-op for text formats, where a declared format IS honored, and when
-     * the format is not yet knowable at PUT (so this query-time check is the gate). Needs only the sourceType and the
-     * declaration — no inferred schema — so the strict paths can call it too.
+     * The declaration-vs-source violations detectable without reading file content: a declared column colliding with a
+     * hive partition key. Every declaration resolution path (strict single/multi and the non-strict overlay) funnels
+     * through this one guard so enforcement stays uniform and a future path cannot silently skip a check. The
+     * type-vs-file checks ({@link #rejectUncoercibleFileTypedRetypes}, {@link #rejectStrictColumnarUncoercibleTypes})
+     * live apart because they need a physical schema this no-I/O guard never reads.
      */
-    private static void rejectDeclaredFormatOnColumnar(String sourceType, DatasetMapping declaredMapping) {
-        // sourceType is null when the format is not knowable (extensionless path, no format/reader override); guard it
-        // before Set.contains (an immutable Set throws on a null arg) so an unresolvable-format dataset keeps its prior
-        // clean downstream error instead of an NPE-wrapped 500.
-        if (sourceType == null || FILE_TYPED_FORMATS.contains(sourceType) == false || declaredMapping.mappings() == null) {
-            return;
-        }
-        for (Map.Entry<String, DatasetFieldMapping> e : declaredMapping.mappings().properties().entrySet()) {
-            if (e.getValue().format() != null) {
-                throw new IllegalArgumentException(
-                    "[format] on column ["
-                        + e.getKey()
-                        + "] is not supported for ["
-                        + sourceType
-                        + "] datasets; columns carry their own native type"
-                );
-            }
-        }
+    private static void rejectDeclaredMappingViolations(@Nullable PartitionMetadata partitionMetadata, DatasetMapping declaredMapping) {
+        rejectDeclaredPartitionCollision(partitionMetadata, declaredMapping);
     }
 
     /**
@@ -702,13 +682,15 @@ public class ExternalSourceResolver {
     /**
      * For a STRICT declaration on a columnar (file-typed) format, validate the declared column types against the file's
      * physical schema. Strict builds its output purely from the declaration and never reads content, but a columnar
-     * reader emits the file's OWN types — so a declared type that differs from the physical type does not error and does
-     * not reinterpret; it yields silent nulls. Read one anchor file's physical schema — through the schema cache when the
-     * provider is cacheable, exactly like the inferred path, so repeat queries against a strict columnar dataset do not
-     * re-read the footer — and run the same type check the non-strict overlay runs, turning the silent-null trap into an
-     * actionable resolution error. No-op for text formats, which parse into the declared type.
+     * reader emits the file's OWN types unless it can coerce them to the declared type at decode time
+     * ({@link DeclaredTypeCoercions#supports}) — an uncoercible declared type does not error and does not reinterpret;
+     * it yields silent nulls. Read one anchor file's physical schema — through the schema cache when the provider is
+     * cacheable, exactly like the inferred path, so repeat queries against a strict columnar dataset do not re-read
+     * the footer — and run the same coercibility check the non-strict overlay runs, turning the silent-null trap into
+     * either a working read-time coercion or an actionable resolution error. No-op for text formats, which parse into
+     * the declared type.
      */
-    private void rejectStrictColumnarTypeMismatch(
+    private void rejectStrictColumnarUncoercibleTypes(
         String sourceType,
         StorageProvider provider,
         StoragePath anchor,
@@ -722,28 +704,35 @@ public class ExternalSourceResolver {
         List<Attribute> physicalSchema = (isCacheable(provider)
             ? cachedResolveSingleSource(anchor, anchorMtime, config)
             : resolveSingleSource(anchor.toString(), config)).schema();
-        rejectFileTypedRetypes(
-            wrapAsExternalSourceMetadata(
-                new SimpleSourceMetadata(physicalSchema, sourceType, anchor.toString()),
-                config,
-                DeclaredReadSpec.NONE
-            ),
-            declaredMapping
-        );
+        rejectUncoercibleFileTypedRetypes(physicalSchema, sourceType, declaredMapping);
     }
 
     /**
-     * For a file-typed format, every declared column's type must equal the reconciled (inferred) type of the physical
-     * column it reads. The readers emit the file's own types; reconciliation already casts per file toward the unified
-     * type — so a matching declaration works by construction, and a differing one would surface as an internal block
-     * type mismatch deep in the engine. Reject it here, at resolution, with an actionable message instead. (Casting a
-     * columnar column to a different declared type is a natural later increment on this same seam.)
+     * For a file-typed format, every declared column's type must either equal the reconciled (inferred) type of the
+     * physical column it reads, or be a type the reader can coerce it into at decode time
+     * ({@link DeclaredTypeCoercions#supports} — e.g. an {@code int64} column declared {@code datetime}, a string
+     * column declared {@code datetime} parsed with the column's declared {@code format}). Anything else would surface
+     * as an internal block type mismatch deep in the engine or as silent nulls; reject it here, at resolution, with an
+     * actionable message instead.
+     * <p>
+     * The same walk polices a declared date {@code format}: on a file-typed format it only ever takes effect as the
+     * string&rarr;date parse pattern, so a format on a column whose physical type is not a string could never apply
+     * and is rejected rather than silently ignored. (On text formats the format is always honored — the parse IS the
+     * coercion — so text never reaches this check.)
+     * <p>
+     * {@code parquet-rs} (in {@link #FILE_TYPED_FORMATS} but not {@link #COERCING_FILE_TYPED_FORMATS}) keeps the
+     * strict equality check: its Arrow conversion layer has no coercion hook yet.
      */
-    private static void rejectFileTypedRetypes(ExternalSourceMetadata inferred, DatasetMapping declaredMapping) {
+    private static void rejectUncoercibleFileTypedRetypes(
+        List<Attribute> inferredSchema,
+        String sourceType,
+        DatasetMapping declaredMapping
+    ) {
         Map<String, DataType> inferredTypes = new HashMap<>();
-        for (Attribute a : inferred.schema()) {
+        for (Attribute a : inferredSchema) {
             inferredTypes.put(a.name(), a.dataType());
         }
+        boolean coercing = COERCING_FILE_TYPED_FORMATS.contains(sourceType);
         for (Map.Entry<String, DatasetFieldMapping> e : declaredMapping.mappings().properties().entrySet()) {
             String physical = e.getValue().path() != null ? e.getValue().path() : e.getKey();
             DataType inferredType = inferredTypes.get(physical);
@@ -751,20 +740,39 @@ public class ExternalSourceResolver {
                 continue; // absence is handled by the overlay's own missing-column check
             }
             DataType declaredType = DataType.fromNameOrAlias(e.getValue().type());
-            if (declaredType != inferredType) {
+            boolean coercible = coercing
+                ? DeclaredTypeCoercions.supports(inferredType, declaredType)
+                : declaredType == inferredType;
+            if (coercible == false) {
                 throw new IllegalArgumentException(
                     "declared type ["
                         + e.getValue().type()
                         + "] for column ["
                         + e.getKey()
-                        + "] does not match the file's type ["
+                        + "] cannot be read from the file's type ["
                         + inferredType.typeName().toLowerCase(Locale.ROOT)
                         + "] — ["
-                        + inferred.sourceType()
-                        + "] columns carry their own type; declare the file's type and cast in the query if needed"
+                        + sourceType
+                        + "] columns carry their own type and no read-time conversion exists for this pair;"
+                        + " declare the file's type and cast in the query if needed"
+                );
+            }
+            if (e.getValue().format() != null && isStringType(inferredType) == false) {
+                throw new IllegalArgumentException(
+                    "[format] on column ["
+                        + e.getKey()
+                        + "] is not supported for ["
+                        + sourceType
+                        + "] datasets when the file's column type is ["
+                        + inferredType.typeName().toLowerCase(Locale.ROOT)
+                        + "]; a format only applies when parsing a string column into a date"
                 );
             }
         }
+    }
+
+    private static boolean isStringType(DataType type) {
+        return type == DataType.KEYWORD || type == DataType.TEXT;
     }
 
     private ExternalSourceResolution.ResolvedSource applyNonStrictOverlay(
@@ -772,17 +780,16 @@ public class ExternalSourceResolver {
         DatasetMapping declaredMapping
     ) {
         final ExternalSourceMetadata inferred = resolved.metadata();
-        // Format-on-columnar + partition collision: the same combined guard the strict paths run. The inferred schema
-        // already carries the partition columns, so a declared column colliding with a partition key would
-        // overlay/retype it and misbind at read time.
-        rejectDeclaredMappingViolations(
-            inferred.sourceType(),
-            resolved.fileList() != null ? resolved.fileList().partitionMetadata() : null,
-            declaredMapping
-        );
-        // Non-strict-only: for a self-typed (columnar) reader the declared type must equal the file's inferred type.
-        if (FILE_TYPED_FORMATS.contains(inferred.sourceType())) {
-            rejectFileTypedRetypes(inferred, declaredMapping);
+        PartitionMetadata partitionMetadata = resolved.fileList() != null ? resolved.fileList().partitionMetadata() : null;
+        // Partition collision: the same guard the strict paths run. The inferred schema already carries the partition
+        // columns, so a declared column colliding with a partition key would overlay/retype it and misbind at read time.
+        rejectDeclaredMappingViolations(partitionMetadata, declaredMapping);
+        // Non-strict-only: for a self-typed (columnar) reader the declared type must equal the file's inferred type or
+        // be coercible from it at decode time. Checked against the unified schema here and per file below (under
+        // union-by-name a single file's inferred type can differ from the unified one).
+        boolean fileTyped = FILE_TYPED_FORMATS.contains(inferred.sourceType());
+        if (fileTyped) {
+            rejectUncoercibleFileTypedRetypes(inferred.schema(), inferred.sourceType(), declaredMapping);
         }
         DeclaredSchemaResolver.Overlaid unified = DeclaredSchemaResolver.overlayNonStrict(inferred.schema(), declaredMapping, false);
         ExternalSourceMetadata overlaidMetadata = new ExternalSourceMetadata() {
@@ -821,17 +828,42 @@ public class ExternalSourceResolver {
                 return inferred.config();
             }
         };
+        // Recompute per-file mappings when the declaration can retype columns. The inherited mapping was built against
+        // the INFERRED unified schema; a declared retype changes both the unified target type and (via the per-file
+        // overlay) the type the reader emits, so a stale cast slot — e.g. a union-by-name KEYWORD fallback for a column
+        // now declared datetime — would corrupt the page. Rebuilding from the two overlaid schemas keeps the
+        // union-by-name widening casts for undeclared columns and drops the now-satisfied ones for declared columns.
+        // The mapping width is the data-only unified schema (partition columns are path-derived, never read), matching
+        // the width every inherited mapping already has.
+        boolean hasDeclaredColumns = declaredMapping.mappings() != null && declaredMapping.mappings().properties().isEmpty() == false;
+        List<Attribute> dataOnlyUnifiedOverlaid = unified.output();
+        if (partitionMetadata != null && partitionMetadata.isEmpty() == false) {
+            dataOnlyUnifiedOverlaid = ExternalSchema.dataAttributesOf(
+                dataOnlyUnifiedOverlaid,
+                partitionMetadata.partitionColumns().keySet()
+            ).attributes();
+        }
         Map<StoragePath, SchemaReconciliation.FileSchemaInfo> overlaidSchemaMap = new HashMap<>();
         for (Map.Entry<StoragePath, SchemaReconciliation.FileSchemaInfo> e : resolved.schemaMap().entrySet()) {
             SchemaReconciliation.FileSchemaInfo info = e.getValue();
+            if (fileTyped) {
+                // Per-file coercibility: under union-by-name this file's inferred type for a declared column can
+                // differ from the unified type checked above; every file the declared column reads from must be
+                // coercible on its own or the read would silently null. Names are physical on both sides here
+                // (pre-overlay), matching the declared `path` physicals.
+                rejectUncoercibleFileTypedRetypes(info.fileSchema().attributes(), inferred.sourceType(), declaredMapping);
+            }
             DeclaredSchemaResolver.Overlaid perFile = DeclaredSchemaResolver.overlayNonStrict(
                 info.fileSchema().attributes(),
                 declaredMapping,
                 true
             );
+            ColumnMapping mapping = hasDeclaredColumns
+                ? SchemaReconciliation.computeMapping(dataOnlyUnifiedOverlaid, perFile.fileSchema())
+                : info.mapping();
             overlaidSchemaMap.put(
                 e.getKey(),
-                new SchemaReconciliation.FileSchemaInfo(new ExternalSchema(perFile.fileSchema()), info.mapping(), info.statistics())
+                new SchemaReconciliation.FileSchemaInfo(new ExternalSchema(perFile.fileSchema()), mapping, info.statistics())
             );
         }
         return new ExternalSourceResolution.ResolvedSource(overlaidMetadata, resolved.fileList(), overlaidSchemaMap);

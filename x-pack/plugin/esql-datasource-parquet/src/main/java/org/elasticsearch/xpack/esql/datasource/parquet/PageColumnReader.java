@@ -1420,6 +1420,17 @@ final class PageColumnReader implements Releasable {
         if (info.parquetType() == PrimitiveType.PrimitiveTypeName.INT96) {
             return readInt96Batch(maxRows, blockFactory);
         }
+        if (info.parquetType() == PrimitiveType.PrimitiveTypeName.BINARY) {
+            // Declared string->datetime coercion: decode the column natively as bytes (dictionary and plain paths
+            // both reused as-is), then parse each value with the column's declared format (ISO default) via the
+            // shared scalar. An unparseable value fails the read loudly - never a silent null.
+            Block bytes = readBytesBatch(maxRows, blockFactory);
+            try {
+                return ParquetColumnDecoding.bytesBlockToDatetimeMillis(bytes, info.dateFormatter(), blockFactory);
+            } finally {
+                bytes.close();
+            }
+        }
         boolean isDate = info.parquetType() == PrimitiveType.PrimitiveTypeName.INT32;
         long[] values = UninitializedArrays.newLongArray(maxRows);
         if (maxDefLevel == 0) {

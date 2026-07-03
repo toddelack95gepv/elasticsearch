@@ -8,6 +8,7 @@
 package org.elasticsearch.xpack.esql.datasources.spi;
 
 import org.apache.lucene.util.BytesRef;
+import org.elasticsearch.common.network.InetAddresses;
 import org.elasticsearch.common.time.DateFormatter;
 import org.elasticsearch.compute.data.Block;
 import org.elasticsearch.compute.data.BlockFactory;
@@ -16,11 +17,14 @@ import org.elasticsearch.compute.data.BytesRefBlock;
 import org.elasticsearch.compute.data.DoubleBlock;
 import org.elasticsearch.compute.data.LongBlock;
 import org.elasticsearch.compute.test.TestBlockFactory;
+import org.elasticsearch.core.Booleans;
+import org.elasticsearch.index.mapper.NumberFieldMapper;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.core.util.NumericUtils;
 import org.elasticsearch.xpack.esql.core.util.StringUtils;
 
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -95,10 +99,98 @@ public class DeclaredTypeCoercionsTests extends ESTestCase {
             case LONG, INTEGER, DOUBLE, UNSIGNED_LONG -> fromString || fromWhole || from == DataType.DOUBLE;
             case BOOLEAN -> fromString; // number->boolean does not ingest
             case DATETIME -> fromString || from == DataType.INTEGER || from == DataType.LONG || from == DataType.UNSIGNED_LONG;
-            case DATE_NANOS -> fromString; // a millis payload is not nanos
+            // string parse, or the millis->nanos widen a date_nanos field runs on an epoch-millis
+            // token at ingest (also cross-file DATETIME + DATE_NANOS unification); a raw long stays
+            // out — ambiguous between millis and nanos
+            case DATE_NANOS -> fromString || from == DataType.DATETIME;
             case IP -> fromString;
             default -> false;
         };
+    }
+
+    /**
+     * Drives the ACTUAL mapper coercion primitives — {@link NumberFieldMapper.NumberType#parse}
+     * with {@code coerce=true}, {@link Booleans#parseBoolean(String)} (the boolean mapper's strict
+     * token rule), {@link InetAddresses#forString} (the ip mapper's parse) — over a representative
+     * well-formed value per source type and asserts {@link DeclaredTypeCoercions#supports} agrees
+     * with what the mapper accepts or rejects, so the hand-encoded pair set cannot drift from the
+     * real mapper rules. Scoped to the numeric / boolean / ip targets whose mapper primitive is a
+     * pure value function; the temporal targets are format-driven (declared format, epoch-millis
+     * reinterpret) and their semantics are pinned by the parse/cast tests in this class instead —
+     * a raw mapper probe there would accept {@code epoch_millis} longs into {@code date_nanos},
+     * exactly the millis-vs-nanos ambiguity {@code supports} deliberately excludes.
+     */
+    public void testSupportsAgreesWithActualMapperAcceptance() {
+        List<DataType> sources = List.of(
+            DataType.KEYWORD,
+            DataType.TEXT,
+            DataType.INTEGER,
+            DataType.LONG,
+            DataType.UNSIGNED_LONG,
+            DataType.DOUBLE,
+            DataType.BOOLEAN,
+            DataType.DATETIME,
+            DataType.DATE_NANOS
+        );
+        List<DataType> targets = List.of(DataType.LONG, DataType.INTEGER, DataType.DOUBLE, DataType.BOOLEAN, DataType.IP);
+        for (DataType from : sources) {
+            for (DataType to : targets) {
+                if (from == to) {
+                    continue; // identity is not a coercion; nothing to probe
+                }
+                Object value = representativeValue(from, to);
+                assertThat(
+                    "supports(" + from.typeName() + ", " + to.typeName() + ") must agree with the mapper on [" + value + "]",
+                    DeclaredTypeCoercions.supports(from, to),
+                    equalTo(mapperAccepts(to, value))
+                );
+            }
+        }
+    }
+
+    /**
+     * A representative decoded value of {@code from} in the Java shape the block value-readers
+     * produce, well-formed for {@code to}'s domain where the source can express one (a string
+     * source picks the token by target — {@code "true"} for boolean, an address for ip — since
+     * string coercibility is per-token by nature).
+     */
+    private static Object representativeValue(DataType from, DataType to) {
+        if (from == DataType.KEYWORD || from == DataType.TEXT) {
+            return switch (to) {
+                case BOOLEAN -> "true";
+                case IP -> "10.20.30.40";
+                default -> "42";
+            };
+        }
+        return switch (from) {
+            case INTEGER -> 42;
+            case LONG -> 42L;
+            case UNSIGNED_LONG -> BigInteger.valueOf(42);
+            case DOUBLE -> 42.5d;
+            case BOOLEAN -> Boolean.TRUE;
+            // decoded temporals are epoch longs; keep the representative small so pair-level
+            // support isn't conflated with a per-value range failure on narrow targets
+            case DATETIME, DATE_NANOS -> 42L;
+            default -> throw new AssertionError("no representative for " + from);
+        };
+    }
+
+    /** Whether the target type's actual mapper primitive ingests {@code value}. */
+    private static boolean mapperAccepts(DataType to, Object value) {
+        try {
+            switch (to) {
+                case LONG -> NumberFieldMapper.NumberType.LONG.parse(value, true);
+                case INTEGER -> NumberFieldMapper.NumberType.INTEGER.parse(value, true);
+                case DOUBLE -> NumberFieldMapper.NumberType.DOUBLE.parse(value, true);
+                // the boolean/ip mappers ingest the token's text; both delegate to these primitives
+                case BOOLEAN -> Booleans.parseBoolean(value.toString());
+                case IP -> InetAddresses.forString(value.toString());
+                default -> throw new AssertionError("no mapper primitive probed for " + to);
+            }
+            return true;
+        } catch (IllegalArgumentException e) { // includes NumberFormatException
+            return false;
+        }
     }
 
     /** The pairs this change opened up, called out explicitly so the contract reads as a test. */
@@ -207,6 +299,29 @@ public class DeclaredTypeCoercionsTests extends ESTestCase {
                 assertThat(((BytesRefBlock) cast).getBytesRef(0, new BytesRef()).utf8ToString(), equalTo("2000-10-10T20:55:36.000Z"));
             }
         }
+    }
+
+    public void testCastDatetimeToDateNanosWidensAndRangeChecks() {
+        // The millis->nanos widen (also what cross-file DATETIME + DATE_NANOS unification runs):
+        // in-range instants multiply by 1e6; a pre-epoch or post-2262 instant is unrepresentable
+        // in date_nanos and nulls the cell with a warning — the TO_DATE_NANOS range rule
+        // (DateUtils.toNanoSeconds), never a silent long overflow.
+        List<String> warnings = new ArrayList<>();
+        SkipWarnings sink = capturing(warnings);
+        long outOfRange = Long.MAX_VALUE / 1_000L; // ~year 292M — far past the 2262 nanos horizon
+        try (Block source = blockFactory.newLongArrayVector(new long[] { 971211336000L, -1L, outOfRange }, 3).asBlock()) {
+            try (
+                Block cast = DeclaredTypeCoercions.castBlock(source, DataType.DATETIME, DataType.DATE_NANOS, null, blockFactory, "ts", sink)
+            ) {
+                LongBlock nanos = (LongBlock) cast;
+                assertThat(nanos.getLong(nanos.getFirstValueIndex(0)), equalTo(971211336000L * 1_000_000L));
+                assertTrue("pre-epoch instant is unrepresentable in date_nanos", nanos.isNull(1));
+                assertTrue("post-2262 instant must not silently overflow", nanos.isNull(2));
+            }
+        }
+        assertThat(warnings, hasSize(2));
+        assertThat(warnings.get(0), containsString("ts"));
+        assertThat(warnings.get(0), containsString("declared type [date_nanos]"));
     }
 
     public void testCastStringToDatetimeHonorsDeclaredFormat() {

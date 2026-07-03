@@ -9,6 +9,7 @@ package org.elasticsearch.xpack.esql.datasources.spi;
 
 import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.common.time.DateFormatter;
+import org.elasticsearch.common.time.DateUtils;
 import org.elasticsearch.compute.data.Block;
 import org.elasticsearch.compute.data.BlockFactory;
 import org.elasticsearch.compute.data.BooleanBlock;
@@ -58,14 +59,19 @@ import java.util.function.IntFunction;
  *   <li><b>string targets</b> ({@code keyword}/{@code text}): any scalar source — ingest
  *       stringifies the token (temporal sources render in the ISO form the default date format
  *       parses back);</li>
- *   <li><b>{@code boolean}</b>: string sources only ({@code "true"}/{@code "false"}, the strict
- *       boolean-mapper token set — numbers do not ingest into a boolean field);</li>
+ *   <li><b>{@code boolean}</b>: string sources only ({@code "true"}/{@code "false"} via
+ *       {@link Booleans#parseBoolean(String)}, the same strict-token primitive the boolean
+ *       mapper delegates to — numbers do not ingest into a boolean field);</li>
  *   <li><b>{@code datetime}</b>: string sources parse via {@link #parseDatetimeMillis} with the
  *       column's declared {@code format} (else the ISO default), whole-number sources
  *       reinterpret as epoch milliseconds (the {@code epoch_millis} half of the default date
  *       format);</li>
- *   <li><b>{@code ip}</b>: string sources only, parsed and encoded exactly like the ip mapper's
- *       doc values.</li>
+ *   <li><b>{@code date_nanos}</b>: string sources parse ISO, {@code datetime} sources widen
+ *       millis&rarr;nanos (what an epoch-millis token ingests to in a {@code date_nanos} field;
+ *       out-of-nanos-range instants fail per value). Plain whole numbers stay out — a raw long
+ *       is ambiguous between a millis and a nanos payload;</li>
+ *   <li><b>{@code ip}</b>: string sources only, parsed with the same underlying primitive the ip
+ *       mapper delegates to ({@code InetAddresses} parse + the 16-byte doc-values encoding).</li>
  * </ul>
  * {@code NULL}/{@code UNSUPPORTED} physical columns support nothing (the readers cannot decode a
  * value to coerce). An unsupported pair is rejected at resolution with an actionable error;
@@ -128,9 +134,12 @@ public final class DeclaredTypeCoercions {
             case LONG, INTEGER, DOUBLE, UNSIGNED_LONG -> fromString || fromNumeric;
             case BOOLEAN -> fromString; // the boolean mapper accepts only true/false tokens, never numbers
             // Epoch-millis reinterpret for whole numbers; a nanos payload is NOT millis, so
-            // date_nanos sources don't reinterpret into datetime (nor vice versa).
+            // date_nanos sources don't reinterpret into datetime.
             case DATETIME -> fromString || from == DataType.INTEGER || from == DataType.LONG || from == DataType.UNSIGNED_LONG;
-            case DATE_NANOS -> fromString;
+            // String parse, or the millis->nanos widen an epoch-millis token gets when ingested
+            // into a date_nanos field (also the cross-file DATETIME + DATE_NANOS unification).
+            // Plain whole numbers stay out: a raw long is ambiguous between millis and nanos.
+            case DATE_NANOS -> fromString || from == DataType.DATETIME;
             case IP -> fromString;
             default -> false;
         };
@@ -305,7 +314,20 @@ public final class DeclaredTypeCoercions {
                 ? v -> parseDatetimeMillis((String) v, declaredFormat)
                 // Whole-number source: epoch-millis reinterpret; the mapper coercion supplies the range check.
                 : v -> NumberFieldMapper.NumberType.LONG.parse(v, true).longValue();
-            case DATE_NANOS -> v -> EsqlDataTypeConverter.dateNanosToLong((String) v);
+            case DATE_NANOS -> {
+                if (fromString) {
+                    yield v -> EsqlDataTypeConverter.dateNanosToLong((String) v);
+                }
+                if (from == DataType.DATETIME) {
+                    // millis -> nanos widen; DateUtils.toNanoSeconds throws IllegalArgumentException
+                    // on pre-epoch and post-2262 instants — the same range rule as TO_DATE_NANOS —
+                    // so an unrepresentable instant nulls the cell instead of silently overflowing.
+                    yield v -> DateUtils.toNanoSeconds((Long) v);
+                }
+                throw new IllegalArgumentException(
+                    "cannot coerce from [" + from.typeName() + "] to [" + to.typeName() + "]; supports() must gate castBlock callers"
+                );
+            }
             case IP -> v -> StringUtils.parseIP((String) v);
             default -> throw new IllegalArgumentException(
                 "cannot coerce from [" + from.typeName() + "] to [" + to.typeName() + "]; supports() must gate castBlock callers"

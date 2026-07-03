@@ -21,6 +21,7 @@ import org.elasticsearch.core.Releasables;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.datasources.spi.ColumnExtractor;
 import org.elasticsearch.xpack.esql.datasources.spi.DeclaredTypeCoercions;
+import org.elasticsearch.xpack.esql.datasources.spi.ErrorPolicy;
 import org.elasticsearch.xpack.esql.datasources.spi.SkipWarnings;
 import org.elasticsearch.xpack.esql.datasources.spi.StorageObject;
 
@@ -85,8 +86,9 @@ import java.util.concurrent.ExecutionException;
  *   <li><b>Coerce to the target type.</b> The extractor always decodes a column at the file's own
  *       physical type; when the caller-supplied target (planner/declared) type differs, the
  *       stitched block is coerced through {@link DeclaredTypeCoercions#castBlock} — the same
- *       engine (and therefore the same values and the same warn+null failure behavior) as the
- *       eager decode paths in {@link ParquetFormatReader}. Unlike the eager paths nothing is
+ *       engine (and therefore the same values and the same policy-aware failure behavior:
+ *       warn+null by default, fail the read under {@code fail_fast}) as the eager decode paths
+ *       in {@link ParquetFormatReader}. Unlike the eager paths nothing is
  *       fused into the decode loops here, so every non-identity supported pair coerces this way;
  *       a pair {@link DeclaredTypeCoercions#supports} rejects (a drifted glob file) reads as
  *       all-null with a response Warning, mirroring the eager per-file validation.</li>
@@ -108,6 +110,8 @@ final class ParquetColumnExtractor implements ColumnExtractor {
     private final StorageObject storageObject;
     private final ParquetFormatReader reader;
     private final ParquetMetadata ownedFooter;
+    /** See {@link #castBlockWarnings()}. */
+    private final ErrorPolicy errorPolicy;
     private final long rowCount;
     /**
      * Precomputed prefix sum of row counts over {@link #ownedFooter}'s blocks, with a leading
@@ -127,11 +131,15 @@ final class ParquetColumnExtractor implements ColumnExtractor {
      *                      iterators (full-file or range-split) emit file-global row identities,
      *                      so the extractor's address space matches the file rather than any
      *                      split slice.
+     * @param errorPolicy   the read's error policy, inherited from the iterator that produced the
+     *                      row identities so the deferred columns fail (or warn+null) exactly like
+     *                      the eagerly scanned ones
      */
-    ParquetColumnExtractor(StorageObject storageObject, ParquetFormatReader reader, ParquetMetadata ownedFooter) {
+    ParquetColumnExtractor(StorageObject storageObject, ParquetFormatReader reader, ParquetMetadata ownedFooter, ErrorPolicy errorPolicy) {
         this.storageObject = Objects.requireNonNull(storageObject, "storageObject");
         this.reader = Objects.requireNonNull(reader, "reader");
         this.ownedFooter = Objects.requireNonNull(ownedFooter, "ownedFooter");
+        this.errorPolicy = Objects.requireNonNull(errorPolicy, "errorPolicy");
         List<BlockMetaData> blocks = ownedFooter.getBlocks();
         this.rowGroupOffsets = new long[blocks.size() + 1];
         long acc = 0;
@@ -512,8 +520,9 @@ final class ParquetColumnExtractor implements ColumnExtractor {
      * Coerces one stitched physical-type block to the caller's target (planner/declared) type
      * through {@link DeclaredTypeCoercions#castBlock} — the identical engine, formatter (the
      * column's declared date {@code format} via
-     * {@link ParquetFormatReader#declaredDateFormatterFor}), and warn+null failure behavior as the
-     * eager decode paths, so a deferred column reads exactly like an eagerly scanned one. A pair
+     * {@link ParquetFormatReader#declaredDateFormatterFor}), and policy-aware failure behavior
+     * ({@link #castBlockWarnings}) as the eager decode paths, so a deferred column reads exactly
+     * like an eagerly scanned one. A pair
      * {@link DeclaredTypeCoercions#supports} rejects means this file drifted from the anchor
      * footer the resolver validated; mirror the eager per-file validation
      * ({@code validatePlannerTypesAgainstFile}): warn once and read the column as all-null rather
@@ -530,7 +539,7 @@ final class ParquetColumnExtractor implements ColumnExtractor {
                     reader.declaredDateFormatterFor(columnName),
                     factory,
                     columnName,
-                    coercionWarnings()
+                    castBlockWarnings()
                 );
             }
             coercionWarnings().add(
@@ -568,6 +577,18 @@ final class ParquetColumnExtractor implements ColumnExtractor {
             );
         }
         return coercionWarnings;
+    }
+
+    /**
+     * The per-value coercion-failure sink handed to {@code castBlock}, or {@code null} under
+     * {@code fail_fast} so the failure propagates — identical to the eager iterators'
+     * policy-aware {@code coercionWarnings()}. The drifted-glob whole-column-null fallback in
+     * {@link #coerceToTarget} stays on the always-live {@link #coercionWarnings()} regardless of
+     * policy, mirroring the eager per-file validation which also warns+nulls under every policy.
+     */
+    @Nullable
+    private SkipWarnings castBlockWarnings() {
+        return errorPolicy.isStrict() ? null : coercionWarnings();
     }
 
     private void validatePositions(long[] localPositions, int count) {

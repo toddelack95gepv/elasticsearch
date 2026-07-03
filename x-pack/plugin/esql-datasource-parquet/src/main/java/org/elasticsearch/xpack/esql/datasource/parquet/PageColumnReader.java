@@ -167,8 +167,9 @@ final class PageColumnReader implements Releasable {
     Block readBatch(int maxRows, BlockFactory blockFactory) {
         loadDictionaryIfNeeded();
         // Declared-type coercion beyond the fused pairs: decode the column at the file's own type
-        // with the arms below, then coerce the block to the declared type (bulk-API leniency: an
-        // unconvertible value nulls its cell and emits a response Warning).
+        // with the arms below, then coerce the block to the declared type. Per-value failures
+        // follow the read's error policy: a live coercionWarnings sink nulls the cell + emits a
+        // response Warning, a null sink (fail_fast) fails the read.
         DataType declared = info.esqlType();
         DataType fileType = info.fileEsqlType();
         if (fileType != null
@@ -1473,10 +1474,17 @@ final class PageColumnReader implements Releasable {
         if (info.parquetType() == PrimitiveType.PrimitiveTypeName.BINARY) {
             // Declared string->datetime coercion: decode the column natively as bytes (dictionary and plain paths
             // both reused as-is), then parse each value with the column's declared format (ISO default) via the
-            // shared scalar. An unparseable value fails the read loudly - never a silent null.
+            // shared scalar. An unparseable value follows the read's error policy through onCoercionFailure:
+            // a live sink nulls the position + warns, a null sink (fail_fast) fails the read.
             Block bytes = readBytesBatch(maxRows, blockFactory);
             try {
-                return ParquetColumnDecoding.bytesBlockToDatetimeMillis(bytes, info.dateFormatter(), blockFactory);
+                return ParquetColumnDecoding.bytesBlockToDatetimeMillis(
+                    bytes,
+                    info.dateFormatter(),
+                    blockFactory,
+                    String.join(".", descriptor.getPath()),
+                    coercionWarnings
+                );
             } finally {
                 bytes.close();
             }

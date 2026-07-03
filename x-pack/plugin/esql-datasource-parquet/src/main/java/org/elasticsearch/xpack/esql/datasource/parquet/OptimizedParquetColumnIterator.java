@@ -35,6 +35,7 @@ import org.elasticsearch.compute.data.ElementType;
 import org.elasticsearch.compute.data.Page;
 import org.elasticsearch.compute.data.UninitializedArrays;
 import org.elasticsearch.compute.operator.CloseableIterator;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.Releasable;
 import org.elasticsearch.core.Releasables;
 import org.elasticsearch.logging.LogManager;
@@ -44,6 +45,7 @@ import org.elasticsearch.xpack.esql.core.expression.Expression;
 import org.elasticsearch.xpack.esql.datasources.spi.ColumnExtractor;
 import org.elasticsearch.xpack.esql.datasources.spi.ColumnExtractorProducer;
 import org.elasticsearch.xpack.esql.datasources.spi.DynamicThreshold;
+import org.elasticsearch.xpack.esql.datasources.spi.ErrorPolicy;
 import org.elasticsearch.xpack.esql.datasources.spi.FormatReader;
 import org.elasticsearch.xpack.esql.datasources.spi.SkipWarnings;
 import org.elasticsearch.xpack.esql.datasources.spi.StorageObject;
@@ -109,6 +111,8 @@ final class OptimizedParquetColumnIterator implements CloseableIterator<Page>, C
     private final String fileLocation;
     /** See {@link #coercionWarnings()}. */
     private SkipWarnings coercionWarnings;
+    /** The read's error policy; strict ({@code fail_fast}) makes {@link #coercionWarnings()} return {@code null}. */
+    private final ErrorPolicy errorPolicy;
     private final ColumnInfo[] columnInfos;
     private final PreloadedRowGroupMetadata preloadedMetadata;
     private final StorageObject storageObject;
@@ -323,8 +327,10 @@ final class OptimizedParquetColumnIterator implements CloseableIterator<Page>, C
         ParquetMetadata fullFooter,
         DynamicThreshold dynamicThreshold,
         ColumnDescriptor sortColumnDescriptor,
-        ParquetReaderCounters counters
+        ParquetReaderCounters counters,
+        ErrorPolicy errorPolicy
     ) {
+        this.errorPolicy = errorPolicy;
         this.reader = reader;
         this.projectedSchema = projectedSchema;
         this.attributes = attributes;
@@ -2249,9 +2255,15 @@ final class OptimizedParquetColumnIterator implements CloseableIterator<Page>, C
     /**
      * Lazily-created sink for per-value declared-coercion failures (capped response Warning
      * headers + nulled cells); shared by every column and row group of this iterator so the cap
-     * is per read, not per column chunk.
+     * is per read, not per column chunk. Returns {@code null} under {@code fail_fast} — the
+     * strict contract of {@code DeclaredTypeCoercions}, where a {@code null} sink means the
+     * failure propagates and the read fails instead of warn+null.
      */
+    @Nullable
     private SkipWarnings coercionWarnings() {
+        if (errorPolicy.isStrict()) {
+            return null;
+        }
         if (coercionWarnings == null) {
             coercionWarnings = new SkipWarnings(
                 "Parquet file ["
@@ -2274,7 +2286,7 @@ final class OptimizedParquetColumnIterator implements CloseableIterator<Page>, C
         // regardless of whether this iterator was opened on the full file or on a range. That's
         // the whole point of file-global addressing: any iterator that emits identities and any
         // extractor over the same file agree without coordination.
-        return new ParquetColumnExtractor(storageObject, formatReader, fullFooter);
+        return new ParquetColumnExtractor(storageObject, formatReader, fullFooter, errorPolicy);
     }
 
     @Override

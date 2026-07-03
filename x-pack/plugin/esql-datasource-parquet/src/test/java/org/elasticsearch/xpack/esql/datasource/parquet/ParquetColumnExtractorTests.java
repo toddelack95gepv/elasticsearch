@@ -34,6 +34,7 @@ import org.elasticsearch.compute.data.LongBlock;
 import org.elasticsearch.core.Releasables;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.xpack.esql.datasources.spi.ColumnExtractor;
+import org.elasticsearch.xpack.esql.datasources.spi.ErrorPolicy;
 import org.elasticsearch.xpack.esql.datasources.spi.DirectBufferFactory;
 import org.elasticsearch.xpack.esql.datasources.spi.DirectReadBuffer;
 import org.elasticsearch.xpack.esql.datasources.spi.StorageObject;
@@ -83,7 +84,7 @@ public class ParquetColumnExtractorTests extends ESTestCase {
      */
     private ParquetColumnExtractor newFullFileExtractor(StorageObject so) throws IOException {
         ParquetFormatReader reader = new ParquetFormatReader(blockFactory);
-        return new ParquetColumnExtractor(so, reader, loadFooter(so));
+        return new ParquetColumnExtractor(so, reader, loadFooter(so), ErrorPolicy.PERMISSIVE);
     }
 
     private ParquetMetadata loadFooter(StorageObject so) throws IOException {
@@ -174,7 +175,7 @@ public class ParquetColumnExtractorTests extends ESTestCase {
         long[] positions = { 0, secondRowGroupFirstRow, secondRowGroupFirstRow, 0 };
         ParquetFormatReader reader = new ParquetFormatReader(blockFactory);
         try (
-            ColumnExtractor extractor = new ParquetColumnExtractor(so, reader, fullFooter);
+            ColumnExtractor extractor = new ParquetColumnExtractor(so, reader, fullFooter, ErrorPolicy.PERMISSIVE);
             Block block = extractor.extract("v", positions, blockFactory)
         ) {
             IntBlock ints = (IntBlock) block;
@@ -195,7 +196,7 @@ public class ParquetColumnExtractorTests extends ESTestCase {
         long[] positions = { 0, firstNullInSecondRowGroup, firstNullInSecondRowGroup, 0 };
         ParquetFormatReader reader = new ParquetFormatReader(blockFactory);
         try (
-            ColumnExtractor extractor = new ParquetColumnExtractor(so, reader, fullFooter);
+            ColumnExtractor extractor = new ParquetColumnExtractor(so, reader, fullFooter, ErrorPolicy.PERMISSIVE);
             Block block = extractor.extract("v", positions, blockFactory)
         ) {
             IntBlock ints = (IntBlock) block;
@@ -341,7 +342,7 @@ public class ParquetColumnExtractorTests extends ESTestCase {
         long[] positions = { 1, rowInSecondGroup, rowInSecondGroup, 1, 0, emptyRowInSecondGroup, emptyRowInSecondGroup, 0 };
         ParquetFormatReader reader = new ParquetFormatReader(blockFactory);
         try (
-            ColumnExtractor extractor = new ParquetColumnExtractor(so, reader, fullFooter);
+            ColumnExtractor extractor = new ParquetColumnExtractor(so, reader, fullFooter, ErrorPolicy.PERMISSIVE);
             Block block = extractor.extract("vals", positions, blockFactory)
         ) {
             IntBlock ints = (IntBlock) block;
@@ -400,7 +401,7 @@ public class ParquetColumnExtractorTests extends ESTestCase {
         assertTrue("expected multiple row groups, got " + fullFooter.getBlocks().size(), fullFooter.getBlocks().size() >= 3);
 
         ParquetFormatReader reader = new ParquetFormatReader(blockFactory);
-        try (ColumnExtractor extractor = new ParquetColumnExtractor(so, reader, fullFooter)) {
+        try (ColumnExtractor extractor = new ParquetColumnExtractor(so, reader, fullFooter, ErrorPolicy.PERMISSIVE)) {
             // Pick a single survivor — the whole point of the targeted path is "1 survivor → 1
             // row group visited". The chosen position is in the second row group; we then check
             // no read range overlaps the first or third group's chunk space.
@@ -497,7 +498,7 @@ public class ParquetColumnExtractorTests extends ESTestCase {
         // Baseline: single-column extract, count the reads.
         TrackingStorageObject baselineSo = new TrackingStorageObject(data);
         int singleColumnReads;
-        try (ColumnExtractor extractor = new ParquetColumnExtractor(baselineSo, reader, fullFooter)) {
+        try (ColumnExtractor extractor = new ParquetColumnExtractor(baselineSo, reader, fullFooter, ErrorPolicy.PERMISSIVE)) {
             baselineSo.reads.clear();
             try (Block block = extractor.extract("v_int", survivors, blockFactory)) {
                 assertEquals(survivors.length, block.getPositionCount());
@@ -509,7 +510,7 @@ public class ParquetColumnExtractorTests extends ESTestCase {
         // Multi-column extract: the F-2 path. Three columns in one call.
         TrackingStorageObject multiSo = new TrackingStorageObject(data);
         int multiColumnReads;
-        try (ColumnExtractor extractor = new ParquetColumnExtractor(multiSo, reader, fullFooter)) {
+        try (ColumnExtractor extractor = new ParquetColumnExtractor(multiSo, reader, fullFooter, ErrorPolicy.PERMISSIVE)) {
             multiSo.reads.clear();
             Block[] blocks = extractor.extract(new String[] { "v_int", "v_long", "v_str" }, null, survivors, blockFactory);
             try {
@@ -571,7 +572,7 @@ public class ParquetColumnExtractorTests extends ESTestCase {
         try {
             BlockingChunkStorageObject blocking = new BlockingChunkStorageObject(data, ioExecutor, rgWindows);
             ParquetFormatReader reader = new ParquetFormatReader(blockFactory);
-            try (ColumnExtractor extractor = new ParquetColumnExtractor(blocking, reader, fullFooter)) {
+            try (ColumnExtractor extractor = new ParquetColumnExtractor(blocking, reader, fullFooter, ErrorPolicy.PERMISSIVE)) {
                 blocking.armLatch();
                 Thread t = new Thread(() -> {
                     try (Block b = extractor.extract("v", survivors, blockFactory)) {
@@ -675,7 +676,7 @@ public class ParquetColumnExtractorTests extends ESTestCase {
         long nullPos = 0;
         long valuePos = rows - 1;
         long[] positions = { nullPos, valuePos };
-        try (ColumnExtractor extractor = new ParquetColumnExtractor(so, reader, footer)) {
+        try (ColumnExtractor extractor = new ParquetColumnExtractor(so, reader, footer, ErrorPolicy.PERMISSIVE)) {
             try (Block intBlock = extractor.extract("opt_int", positions, blockFactory)) {
                 assertEquals(2, intBlock.getPositionCount());
                 assertTrue("null-leading position must decode null", intBlock.isNull(0));

@@ -1610,8 +1610,9 @@ public class OrcFormatReaderTests extends ESTestCase {
     }
 
     public void testCoercionUnparseableValueEmitsWarningAndNull() throws Exception {
-        // Per-cell bulk leniency: a token the declared type cannot coerce nulls THAT cell and records a response
-        // Warning header — never a hard read failure, never a silent wrong value; the surrounding cells still decode.
+        // Per-cell leniency under the DEFAULT error policy (null context policy -> the reader's
+        // PERMISSIVE null_field default): a token the declared type cannot coerce nulls THAT cell
+        // and records a response Warning header; the surrounding cells still decode.
         TypeDescription schema = TypeDescription.createStruct().addField("n", TypeDescription.createString());
         byte[] orcData = createOrcFile(schema, batch -> {
             batch.size = 3;
@@ -1625,7 +1626,7 @@ public class OrcFormatReaderTests extends ESTestCase {
         try (
             CloseableIterator<Page> it = reader.readRange(
                 storageObject,
-                new RangeReadContext(List.of("n"), 10, 0, orcData.length, plannerSchema, ErrorPolicy.STRICT)
+                new RangeReadContext(List.of("n"), 10, 0, orcData.length, plannerSchema, null)
             )
         ) {
             Page page = it.next();
@@ -1642,6 +1643,254 @@ public class OrcFormatReaderTests extends ESTestCase {
         assertTrue("Summary should mention coercion, got: " + warnings.get(0), warnings.get(0).contains("coerced"));
         assertTrue("Detail should name the column, got: " + warnings.get(1), warnings.get(1).contains("[n]"));
         assertTrue("Detail should name the declared type, got: " + warnings.get(1), warnings.get(1).contains("[long]"));
+    }
+
+    public void testCoercionUnparseableValueFailFastFailsRead() throws Exception {
+        // error_mode: fail_fast makes a coercion failure abort the read — the same outcome the
+        // text readers produce for the same declared coercion on the same bad token.
+        TypeDescription schema = TypeDescription.createStruct().addField("n", TypeDescription.createString());
+        byte[] orcData = createOrcFile(schema, batch -> {
+            batch.size = 2;
+            ((BytesColumnVector) batch.cols[0]).setVal(0, "41".getBytes(StandardCharsets.UTF_8));
+            ((BytesColumnVector) batch.cols[0]).setVal(1, "oops".getBytes(StandardCharsets.UTF_8));
+        });
+        StorageObject storageObject = createStorageObject(orcData);
+        OrcFormatReader reader = new OrcFormatReader(blockFactory);
+        List<Attribute> plannerSchema = List.of(new ReferenceAttribute(Source.EMPTY, "n", DataType.LONG));
+        try (
+            CloseableIterator<Page> it = reader.readRange(
+                storageObject,
+                new RangeReadContext(List.of("n"), 10, 0, orcData.length, plannerSchema, ErrorPolicy.STRICT)
+            )
+        ) {
+            expectThrows(IllegalArgumentException.class, () -> {
+                while (it.hasNext()) {
+                    it.next().releaseBlocks();
+                }
+            });
+        }
+        assertTrue("fail_fast must not emit coercion warnings", drainWarnings().isEmpty());
+    }
+
+    public void testStringToDatetimeBadTokenWarnsAndNullsByDefaultFailsUnderFailFast() throws Exception {
+        // The FUSED string->datetime arm follows the same per-cell leniency as castBlock under the
+        // default policy (bad token -> null cell + Warning, read succeeds) and aborts under
+        // fail_fast — it previously hard-failed the read on any policy.
+        TypeDescription schema = TypeDescription.createStruct().addField("ts", TypeDescription.createString());
+        byte[] orcData = createOrcFile(schema, batch -> {
+            batch.size = 3;
+            ((BytesColumnVector) batch.cols[0]).setVal(0, "2000-10-10T20:55:36Z".getBytes(StandardCharsets.UTF_8));
+            ((BytesColumnVector) batch.cols[0]).setVal(1, "not-a-date".getBytes(StandardCharsets.UTF_8));
+            ((BytesColumnVector) batch.cols[0]).setVal(2, "2000-10-10T20:55:38Z".getBytes(StandardCharsets.UTF_8));
+        });
+        OrcFormatReader reader = new OrcFormatReader(blockFactory);
+        List<Attribute> plannerSchema = List.of(new ReferenceAttribute(Source.EMPTY, "ts", DataType.DATETIME));
+        try (
+            CloseableIterator<Page> it = reader.readRange(
+                createStorageObject(orcData),
+                new RangeReadContext(List.of("ts"), 10, 0, orcData.length, plannerSchema, null)
+            )
+        ) {
+            Page page = it.next();
+            assertEquals(3, page.getPositionCount());
+            LongBlock longs = (LongBlock) page.getBlock(0);
+            assertEquals(971211336000L, longs.getLong(longs.getFirstValueIndex(0)));
+            assertTrue("the bad date token reads as null", longs.isNull(1));
+            assertEquals(971211338000L, longs.getLong(longs.getFirstValueIndex(2)));
+            page.releaseBlocks();
+        }
+        List<String> warnings = drainWarnings();
+        assertEquals("Expected summary + 1 detail, got: " + warnings, 2, warnings.size());
+        assertTrue("Detail should name the column, got: " + warnings.get(1), warnings.get(1).contains("[ts]"));
+        assertTrue("Detail should name the declared type, got: " + warnings.get(1), warnings.get(1).contains("[datetime]"));
+
+        try (
+            CloseableIterator<Page> it = reader.readRange(
+                createStorageObject(orcData),
+                new RangeReadContext(List.of("ts"), 10, 0, orcData.length, plannerSchema, ErrorPolicy.STRICT)
+            )
+        ) {
+            expectThrows(IllegalArgumentException.class, () -> {
+                while (it.hasNext()) {
+                    it.next().releaseBlocks();
+                }
+            });
+        }
+        assertTrue("fail_fast must not emit coercion warnings", drainWarnings().isEmpty());
+    }
+
+    public void testListStringToDatetimeBadTokenNullsWholePosition() throws Exception {
+        // LIST<string> declared datetime: castBlock's bulk semantics on the fused list arm — a bad
+        // element nulls the WHOLE position + warns under the default policy, the clean row still
+        // decodes; under fail_fast the read fails.
+        TypeDescription schema = TypeDescription.createStruct()
+            .addField("vals", TypeDescription.createList(TypeDescription.createString()));
+        byte[] orcData = createOrcFile(schema, batch -> {
+            batch.size = 2;
+            ListColumnVector valsCol = (ListColumnVector) batch.cols[0];
+            valsCol.childCount = 3;
+            BytesColumnVector child = (BytesColumnVector) valsCol.child;
+            child.ensureSize(3, false);
+            valsCol.offsets[0] = 0;
+            valsCol.lengths[0] = 1;
+            child.setVal(0, "2000-10-10T20:55:36Z".getBytes(StandardCharsets.UTF_8));
+            valsCol.offsets[1] = 1;
+            valsCol.lengths[1] = 2;
+            child.setVal(1, "not-a-date".getBytes(StandardCharsets.UTF_8));
+            child.setVal(2, "2000-10-10T20:55:38Z".getBytes(StandardCharsets.UTF_8));
+        });
+        OrcFormatReader reader = new OrcFormatReader(blockFactory);
+        List<Attribute> plannerSchema = List.of(new ReferenceAttribute(Source.EMPTY, "vals", DataType.DATETIME));
+        try (
+            CloseableIterator<Page> it = reader.readRange(
+                createStorageObject(orcData),
+                new RangeReadContext(List.of("vals"), 10, 0, orcData.length, plannerSchema, null)
+            )
+        ) {
+            Page page = it.next();
+            assertEquals(2, page.getPositionCount());
+            LongBlock longs = (LongBlock) page.getBlock(0);
+            assertEquals(971211336000L, longs.getLong(longs.getFirstValueIndex(0)));
+            assertTrue("bulk semantics null the whole position, not one element", longs.isNull(1));
+            page.releaseBlocks();
+        }
+        List<String> warnings = drainWarnings();
+        assertEquals("Expected summary + 1 detail, got: " + warnings, 2, warnings.size());
+
+        try (
+            CloseableIterator<Page> it = reader.readRange(
+                createStorageObject(orcData),
+                new RangeReadContext(List.of("vals"), 10, 0, orcData.length, plannerSchema, ErrorPolicy.STRICT)
+            )
+        ) {
+            expectThrows(IllegalArgumentException.class, () -> {
+                while (it.hasNext()) {
+                    it.next().releaseBlocks();
+                }
+            });
+        }
+        assertTrue("fail_fast must not emit coercion warnings", drainWarnings().isEmpty());
+    }
+
+    public void testListDatetimeNullElementSkippedNotEpochZero() throws Exception {
+        // A [value, null] timestamp list reads as the single-element [value] — null elements are
+        // skipped, never decoded as epoch 0 — and an all-null list is a null position. The
+        // Parquet suite pins the identical expectation
+        // (ParquetFormatReaderTests#testListDatetimeNullElementSkippedNotEpochZero) so the two
+        // columnar readers agree on the shape. Covers the timestamp child arm; the long and
+        // string child arms share the same null-skip in createListDatetimeBlock.
+        TypeDescription schema = TypeDescription.createStruct()
+            .addField("events", TypeDescription.createList(TypeDescription.createTimestampInstant()));
+        long ts = 971211336000L;
+        byte[] orcData = createOrcFile(schema, batch -> {
+            batch.size = 2;
+            ListColumnVector eventsCol = (ListColumnVector) batch.cols[0];
+            eventsCol.childCount = 3;
+            TimestampColumnVector child = (TimestampColumnVector) eventsCol.child;
+            child.ensureSize(3, false);
+            child.noNulls = false;
+            // Row 0: [ts, null]
+            eventsCol.offsets[0] = 0;
+            eventsCol.lengths[0] = 2;
+            child.time[0] = ts;
+            child.nanos[0] = 0;
+            child.isNull[1] = true;
+            // Row 1: [null]
+            eventsCol.offsets[1] = 2;
+            eventsCol.lengths[1] = 1;
+            child.isNull[2] = true;
+        });
+        StorageObject storageObject = createStorageObject(orcData);
+        OrcFormatReader reader = new OrcFormatReader(blockFactory);
+        readFirstPage(reader, storageObject, null, page -> {
+            assertEquals(2, page.getPositionCount());
+            LongBlock longs = (LongBlock) page.getBlock(0);
+            assertEquals("null element is dropped, not decoded as epoch 0", 1, longs.getValueCount(0));
+            assertEquals(ts, longs.getLong(longs.getFirstValueIndex(0)));
+            assertTrue("an all-null list is a null position", longs.isNull(1));
+        });
+    }
+
+    /**
+     * Guard: every {@code DeclaredTypeCoercions.fusedInDecode} pair must decode NATIVELY in this
+     * reader — a fused pair is never routed through {@code castBlock}, so a pair wired into only
+     * the Parquet decode loops would fall through {@code createDatetimeBlock}'s
+     * {@code newConstantNullBlock} tail (or a sibling default arm) and silent-null here.
+     * Enumerates the fused matrix mechanically; a NEW fused pair without a mapping fails loudly
+     * so its author must wire the native arm (in BOTH readers — the Parquet suite carries the
+     * twin of this guard) and extend the mapping.
+     */
+    public void testEveryFusedInDecodePairDecodesNatively() throws Exception {
+        for (DataType from : DataType.values()) {
+            for (DataType to : DataType.values()) {
+                if (from == to || DeclaredTypeCoercions.fusedInDecode(from, to) == false) {
+                    continue;
+                }
+                if (from == DataType.TEXT) {
+                    continue; // no ORC leaf type maps to TEXT; the pair is unreachable from a file
+                }
+                TypeDescription schema = TypeDescription.createStruct();
+                BatchPopulator populator;
+                switch (from) {
+                    case INTEGER -> {
+                        schema.addField("x", TypeDescription.createInt());
+                        populator = batch -> {
+                            batch.size = 1;
+                            ((LongColumnVector) batch.cols[0]).vector[0] = 41L;
+                        };
+                    }
+                    case LONG -> {
+                        schema.addField("x", TypeDescription.createLong());
+                        populator = batch -> {
+                            batch.size = 1;
+                            ((LongColumnVector) batch.cols[0]).vector[0] = 971211336000L;
+                        };
+                    }
+                    case KEYWORD -> {
+                        schema.addField("x", TypeDescription.createString());
+                        String token = to == DataType.DATETIME ? "2000-10-10T20:55:36Z" : "hello";
+                        populator = batch -> {
+                            batch.size = 1;
+                            ((BytesColumnVector) batch.cols[0]).setVal(0, token.getBytes(StandardCharsets.UTF_8));
+                        };
+                    }
+                    default -> throw new AssertionError(
+                        "fused pair "
+                            + from.typeName()
+                            + "->"
+                            + to.typeName()
+                            + " has no native-coverage mapping; wire it into the ORC decode arms and this guard"
+                    );
+                }
+                byte[] orcData = createOrcFile(schema, populator);
+                List<Attribute> plannerSchema = List.of(new ReferenceAttribute(Source.EMPTY, "x", to));
+                OrcFormatReader reader = new OrcFormatReader(blockFactory);
+                try (
+                    CloseableIterator<Page> it = reader.readRange(
+                        createStorageObject(orcData),
+                        new RangeReadContext(List.of("x"), 10, 0, orcData.length, plannerSchema, ErrorPolicy.STRICT)
+                    )
+                ) {
+                    Page page = it.next();
+                    String pair = from.typeName() + "->" + to.typeName();
+                    assertEquals(1, page.getPositionCount());
+                    assertFalse("fused pair " + pair + " must decode natively, not silent-null", page.getBlock(0).isNull(0));
+                    switch (to) {
+                        case LONG -> assertEquals(pair, 41L, ((LongBlock) page.getBlock(0)).getLong(0));
+                        // bigint source reinterprets the raw epoch millis; string source ISO-parses to the same instant
+                        case DATETIME -> assertEquals(pair, 971211336000L, ((LongBlock) page.getBlock(0)).getLong(0));
+                        case KEYWORD, TEXT -> assertEquals(
+                            pair,
+                            new BytesRef("hello"),
+                            ((BytesRefBlock) page.getBlock(0)).getBytesRef(0, new BytesRef())
+                        );
+                        default -> throw new AssertionError("fused pair " + pair + " has no expected-value arm in this guard");
+                    }
+                    page.releaseBlocks();
+                }
+            }
+        }
+        assertTrue("native fused decodes must not warn", drainWarnings().isEmpty());
     }
 
     private List<String> drainWarnings() {

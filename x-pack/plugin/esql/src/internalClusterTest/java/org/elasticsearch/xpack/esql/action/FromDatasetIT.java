@@ -1282,6 +1282,65 @@ public class FromDatasetIT extends AbstractEsqlIntegTestCase {
         }
     }
 
+    public void testStringToDatetimeEquivalentAcrossTextAndColumnar() throws Exception {
+        // DIRECT text<->columnar consistency: the SAME date string + declared format, read as a CSV token (text parse)
+        // and as a Parquet BINARY value (columnar string->date coerce), produces the IDENTICAL instant — because both
+        // route through the one DeclaredTypeCoercions.parseDatetimeMillis. Assert the two reads equal EACH OTHER.
+        assertAcked(client().execute(PutDataSourceAction.INSTANCE, putDataSourceRequest("local_ds", Map.of())));
+
+        java.util.Map<String, DatasetFieldMapping> csvProps = new java.util.LinkedHashMap<>();
+        csvProps.put("ts", new DatasetFieldMapping("date", null, List.of(), ACCESS_LOG_FORMAT));
+        csvProps.put("note", new DatasetFieldMapping("keyword", null));
+        assertAcked(
+            client().execute(
+                PutDatasetAction.INSTANCE,
+                new PutDatasetAction.Request(
+                    TIMEOUT,
+                    TIMEOUT,
+                    "logs_csv_equiv",
+                    "local_ds",
+                    csvDateFixture.toUri().toString(),
+                    null,
+                    new HashMap<>(Map.of("format", "csv")),
+                    new DatasetMapping(new DatasetMapping.Mappings(DatasetMapping.Dynamic.FALSE, csvProps))
+                )
+            )
+        );
+
+        Path parquet = writeParquetStringDateFixture();
+        java.util.Map<String, DatasetFieldMapping> pqProps = new java.util.LinkedHashMap<>();
+        pqProps.put("id", new DatasetFieldMapping("long", null));
+        pqProps.put("ts", new DatasetFieldMapping("date", "event_ts", List.of(), ACCESS_LOG_FORMAT));
+        assertAcked(
+            client().execute(
+                PutDatasetAction.INSTANCE,
+                new PutDatasetAction.Request(
+                    TIMEOUT,
+                    TIMEOUT,
+                    "logs_parquet_equiv",
+                    "local_ds",
+                    parquet.toUri().toString(),
+                    null,
+                    new HashMap<>(Map.of("format", "parquet")),
+                    new DatasetMapping(new DatasetMapping.Mappings(DatasetMapping.Dynamic.FALSE, pqProps))
+                )
+            )
+        );
+
+        long csvMs = coerceStringDateToEpoch("logs_csv_equiv");
+        long parquetMs = coerceStringDateToEpoch("logs_parquet_equiv");
+        assertThat("text and columnar coerce the same string+format to the same instant", parquetMs, equalTo(csvMs));
+        assertThat(csvMs, equalTo(ACCESS_LOG_EPOCH_MILLIS));
+    }
+
+    private long coerceStringDateToEpoch(String dataset) {
+        try (var response = run(syncEsqlQueryRequest("FROM " + dataset + " | SORT ts | EVAL ms = ts::long | KEEP ms | LIMIT 1"), TIMEOUT)) {
+            List<List<Object>> rows = getValuesList(response);
+            assertThat(rows, hasSize(1));
+            return (Long) rows.get(0).get(0);
+        }
+    }
+
     public void testStrictColumnarInt32ToLongCoerces() throws Exception {
         // int32 (salary) declared `long` widens losslessly at read time — the same int->long coercion the ORC unit test
         // exercises, via the same DeclaredTypeCoercions matrix both columnar readers consult (parquet/orc consistency).

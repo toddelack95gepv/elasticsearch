@@ -200,7 +200,9 @@ public class FromDatasetIT extends AbstractExternalDataSourceIT {
         "logs_deferred_coerce",
         "logs_bad_date_token",
         "logs_bad_date_failfast",
-        "logs_csv_bad_date_failfast"
+        "logs_csv_bad_date_failfast",
+        "logs_ndjson_bad_date_failfast",
+        "logs_ndjson_bad_date_permissive"
     );
 
     /**
@@ -1379,7 +1381,7 @@ public class FromDatasetIT extends AbstractExternalDataSourceIT {
     }
 
     public void testColumnarBadDateTokenNullsCellEagerAndDeferred() throws Exception {
-        // The fused string->datetime arm under the DEFAULT error policy: an unparseable token
+        // The fused string->datetime arm under an explicit null_field policy: an unparseable token
         // nulls THAT cell and the query SUCCEEDS — for BOTH plan shapes over the same cell. The
         // eager KEEP decodes the coerced column in the forward scan; the wide-projection TopN
         // defers it to ParquetColumnExtractor. Pre-fix the eager read hard-failed while the
@@ -1480,8 +1482,8 @@ public class FromDatasetIT extends AbstractExternalDataSourceIT {
         // readers: under fail_fast it fails the query (like parquet/CSV); under a non-strict policy (null_field) it
         // nulls THAT cell + emits a response Warning while the query succeeds. Before the fix the NDJSON path
         // null-filled policy-blind — fail_fast silently succeeded and no Warning header was emitted. Both policies are
-        // set explicitly here: NDJSON's DEFAULT error_mode is fail_fast (text formats parse strictly by default),
-        // unlike parquet/orc which default to null_field, so the policy is pinned rather than left to the default.
+        // set explicitly here: the default error_mode is fail_fast for every format (columnar included), so the
+        // null_field leg is pinned rather than left to the default.
         assertAcked(client().execute(PutDataSourceAction.INSTANCE, putDataSourceRequest("local_ds", Map.of())));
         String content = """
             {"ts":"10/Oct/2000:13:55:36 -0700","note":"alpha"}
@@ -1639,7 +1641,9 @@ public class FromDatasetIT extends AbstractExternalDataSourceIT {
                     "local_ds",
                     csv.toUri().toString(),
                     null,
-                    new HashMap<>(Map.of("format", "csv")),
+                    // The shared fixture's second row holds an uncoercible token; this test reads only the good row,
+                    // so tolerate the bad one with null_field (the default is fail_fast) — keeps both legs symmetric.
+                    new HashMap<>(Map.of("format", "csv", "error_mode", "null_field")),
                     new DatasetMapping(new DatasetMapping.Mappings(DatasetMapping.Dynamic.FALSE, csvProps))
                 )
             )
@@ -1659,7 +1663,7 @@ public class FromDatasetIT extends AbstractExternalDataSourceIT {
                     "local_ds",
                     parquet.toUri().toString(),
                     null,
-                    new HashMap<>(Map.of("format", "parquet")),
+                    new HashMap<>(Map.of("format", "parquet", "error_mode", "null_field")),
                     new DatasetMapping(new DatasetMapping.Mappings(DatasetMapping.Dynamic.FALSE, pqProps))
                 )
             )
@@ -1805,7 +1809,9 @@ public class FromDatasetIT extends AbstractExternalDataSourceIT {
                     "local_ds",
                     parquet.toUri().toString(),
                     null,
-                    new HashMap<>(Map.of("format", "parquet")),
+                    // Row 2 carries strings that cannot coerce to the declared long/double/ip; the test asserts they
+                    // null and the query succeeds, which is null_field (opt-in) behavior — the default is fail_fast.
+                    new HashMap<>(Map.of("format", "parquet", "error_mode", "null_field")),
                     mapping
                 )
             )
